@@ -1,0 +1,263 @@
+using System.Runtime.InteropServices;
+using SkiaSharp;
+using Vortice.MediaFoundation;
+
+namespace MediaFoundationPlugin;
+
+internal sealed class VideoSession : IDisposable
+{
+    private const int MaxRetainedBuffers = 4;
+    private static readonly TimeSpan MinimumSeekJumpThreshold = TimeSpan.FromMilliseconds(900);
+    private static readonly SKImageRasterReleaseDelegate ReleasePixelBuffer = static (pixels, context) =>
+    {
+        if (pixels == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (context is UnmanagedFrameBufferPool pool)
+        {
+            pool.Return(pixels);
+            return;
+        }
+
+        Marshal.FreeHGlobal(pixels);
+    };
+
+    private readonly object _sync = new();
+    private readonly IMFSourceReader _reader;
+    private readonly double _fps;
+    private readonly long _frameDurationTicks100ns;
+    private readonly long _seekJumpThresholdTicks100ns;
+
+    private UnmanagedFrameBufferPool _pixelBufferPool;
+    private VideoFormat _format;
+    private long _lastDecodedTimestamp = long.MinValue;
+    private bool _endOfStream;
+    private bool _disposed;
+
+    public VideoSession(string path)
+    {
+        _reader = SourceReaderFactory.CreateVideoReader(path, useOptimizedPipeline: true, out _format, out _fps);
+        _pixelBufferPool = CreatePixelBufferPool(_format);
+        _frameDurationTicks100ns = TimestampUtility.ResolveFrameDurationTicks100ns(_fps);
+        _seekJumpThresholdTicks100ns = Math.Max(_frameDurationTicks100ns * 45L, MinimumSeekJumpThreshold.Ticks);
+    }
+
+    public Task<SKImage?> GetFrameAsync(TimeSpan time)
+    {
+        return Task.Run(() => GetFrame(time));
+    }
+
+    public Task<SKImage?> GetFrameAsync(int frame)
+    {
+        if (frame < 0 || _fps <= 0 || !double.IsFinite(_fps))
+        {
+            return Task.FromResult<SKImage?>(null);
+        }
+
+        TimeSpan time = TimeSpan.FromSeconds(frame / _fps);
+        return GetFrameAsync(time);
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _reader.Dispose();
+            _pixelBufferPool.Dispose();
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    private SKImage? GetFrame(TimeSpan requestTime)
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, nameof(VideoSession));
+
+            long targetTimestamp = TimestampUtility.ConvertToTimestamp100ns(requestTime);
+            if (ShouldSeek(targetTimestamp))
+            {
+                SeekTo(targetTimestamp);
+            }
+
+            return ReadFrameAtOrAfter(targetTimestamp);
+        }
+    }
+
+    private bool ShouldSeek(long targetTimestamp)
+    {
+        if (_lastDecodedTimestamp == long.MinValue)
+        {
+            return true;
+        }
+
+        if (targetTimestamp + (_frameDurationTicks100ns * 2L) < _lastDecodedTimestamp)
+        {
+            return true;
+        }
+
+        long forwardDelta = targetTimestamp - _lastDecodedTimestamp;
+        if (forwardDelta > _seekJumpThresholdTicks100ns)
+        {
+            return true;
+        }
+
+        if (_endOfStream && targetTimestamp >= _lastDecodedTimestamp)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private void SeekTo(long targetTimestamp)
+    {
+        _reader.SetCurrentPosition(targetTimestamp);
+        _lastDecodedTimestamp = long.MinValue;
+        _endOfStream = false;
+    }
+
+    private SKImage? ReadFrameAtOrAfter(long targetTimestamp)
+    {
+        while (true)
+        {
+            IMFSample? sample = _reader.ReadSample(
+                SourceReaderIndex.FirstVideoStream,
+                SourceReaderControlFlag.None,
+                out int _,
+                out SourceReaderFlag streamFlags,
+                out long timestamp);
+
+            using (sample)
+            {
+                if (streamFlags.IsEndOfStream())
+                {
+                    _endOfStream = true;
+                    return null;
+                }
+
+                if (streamFlags.IsMediaTypeChanged())
+                {
+                    RefreshMediaFormat();
+                }
+
+                if (streamFlags.IsStreamTick() || sample is null)
+                {
+                    continue;
+                }
+
+                _lastDecodedTimestamp = timestamp;
+                if (timestamp + (_frameDurationTicks100ns / 2L) < targetTimestamp)
+                {
+                    continue;
+                }
+
+                return ConvertSampleToSkImage(sample, _format, _pixelBufferPool);
+            }
+        }
+    }
+
+    private void RefreshMediaFormat()
+    {
+        using IMFMediaType mediaType = _reader.GetCurrentMediaType(SourceReaderIndex.FirstVideoStream);
+        VideoFormat nextFormat = MediaFormatParser.ReadVideoFormat(mediaType);
+        if (nextFormat.DestinationStride != _format.DestinationStride || nextFormat.Height != _format.Height)
+        {
+            UnmanagedFrameBufferPool oldPool = _pixelBufferPool;
+            _pixelBufferPool = CreatePixelBufferPool(nextFormat);
+            oldPool.Dispose();
+        }
+
+        _format = nextFormat;
+    }
+
+    private static UnmanagedFrameBufferPool CreatePixelBufferPool(VideoFormat format)
+    {
+        int bufferSize = checked(format.DestinationStride * format.Height);
+        return new UnmanagedFrameBufferPool(bufferSize, MaxRetainedBuffers);
+    }
+
+    private static SKImage? ConvertSampleToSkImage(IMFSample sample, VideoFormat format, UnmanagedFrameBufferPool pixelBufferPool)
+    {
+        using IMFMediaBuffer buffer = sample.ConvertToContiguousBuffer();
+        using BufferLockContext lockContext = BufferHelper.LockBuffer(buffer);
+
+        if (lockContext.Data == IntPtr.Zero || lockContext.CurrentLength <= 0)
+        {
+            return null;
+        }
+
+        int destinationRowBytes = format.DestinationStride;
+        int sourceRowBytes = format.SourceStride;
+
+        int requiredBytes = checked(sourceRowBytes * checked(format.Height - 1) + destinationRowBytes);
+        if (lockContext.CurrentLength < requiredBytes)
+        {
+            int tightlyPackedRequired = checked(destinationRowBytes * format.Height);
+            if (lockContext.CurrentLength < tightlyPackedRequired)
+            {
+                return null;
+            }
+
+            sourceRowBytes = destinationRowBytes;
+        }
+
+        if (sourceRowBytes < destinationRowBytes)
+        {
+            return null;
+        }
+
+        IntPtr destination = pixelBufferPool.Rent();
+        bool shouldReturnBuffer = true;
+        try
+        {
+            if (destination == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            if (format.DefaultStride > 0 && sourceRowBytes == destinationRowBytes)
+            {
+                int copyLength = checked(destinationRowBytes * format.Height);
+                BufferHelper.CopyMemory(destination, lockContext.Data, copyLength);
+            }
+            else
+            {
+                for (int y = 0; y < format.Height; y++)
+                {
+                    int sourceY = format.DefaultStride < 0 ? (format.Height - 1 - y) : y;
+                    IntPtr sourceRow = IntPtr.Add(lockContext.Data, checked(sourceY * sourceRowBytes));
+                    IntPtr destinationRow = IntPtr.Add(destination, checked(y * destinationRowBytes));
+                    BufferHelper.CopyMemory(destinationRow, sourceRow, destinationRowBytes);
+                }
+            }
+
+            var imageInfo = new SKImageInfo(format.Width, format.Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+            using var pixmap = new SKPixmap(imageInfo, destination, destinationRowBytes);
+            SKImage? image = SKImage.FromPixels(pixmap, ReleasePixelBuffer, pixelBufferPool);
+            if (image is null)
+            {
+                return null;
+            }
+
+            shouldReturnBuffer = false;
+            return image;
+        }
+        finally
+        {
+            if (shouldReturnBuffer)
+            {
+                pixelBufferPool.Return(destination);
+            }
+        }
+    }
+}
