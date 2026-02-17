@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <Import Project="local.props" Condition="Exists('local.props')" />
+
+  <ItemGroup>
+    <Reference Include="Metasia.Editor.Plugin">
+      <HintPath>$(MetasiaApplicationPath)\Metasia.Editor.Plugin.dll</HintPath>
+    </Reference>
+    <Reference Include="Metasia.Core">
+      <HintPath>$(MetasiaApplicationPath)\Metasia.Core.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.2" />
+  </ItemGroup>
+
+</Project>
