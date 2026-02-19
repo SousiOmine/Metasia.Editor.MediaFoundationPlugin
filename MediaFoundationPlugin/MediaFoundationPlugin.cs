@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Metasia.Core.Encode;
 using Metasia.Core.Media;
 using Metasia.Core.Sounds;
 using Metasia.Editor.Plugin;
@@ -7,11 +8,14 @@ using SkiaSharp;
 
 namespace MediaFoundationPlugin;
 
-public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IDisposable
+public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOutputPlugin, IDisposable
 {
     public string PluginIdentifier { get; } = "SousiOmine.MediaFoundationPlugin";
-    public string PluginVersion { get; } = "0.1.0";
-    public string PluginName { get; } = "MediaFoundation Input";
+    public string PluginVersion { get; } = "0.2.0";
+    public string PluginName { get; } = "MediaFoundation Input/Output";
+
+    string IMediaOutputPlugin.Name => "MediaFoundation MP4";
+    string[] IMediaOutputPlugin.SupportedExtensions => ["*.mp4"];
 
     public IEnumerable<IEditorPlugin.SupportEnvironment> SupportedEnvironments { get; } =
     [
@@ -175,5 +179,10 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IDisposab
         }
 
         _audioSessions.Clear();
+    }
+
+    public EncoderBase CreateEncoderInstance()
+    {
+        return new MediaFoundationOutputEncoder();
     }
 }
