@@ -77,7 +77,7 @@ internal static class SourceReaderFactory
         IMFSourceReader reader = MediaFactory.MFCreateSourceReaderFromURL(path, attributes);
         try
         {
-            reader.SetStreamSelection(SourceReaderIndex.FirstVideoStream, false);
+            reader.SetStreamSelection(SourceReaderIndex.AllStreams, false);
             reader.SetStreamSelection(SourceReaderIndex.FirstAudioStream, true);
 
             using IMFMediaType outputType = MediaFactory.MFCreateMediaType();
