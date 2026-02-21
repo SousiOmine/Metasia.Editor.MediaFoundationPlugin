@@ -136,6 +136,32 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
             return new AudioFileAccessorResult { IsSuccessful = false, Chunk = null };
         }
     }
+    
+    public async Task<AudioSampleResult> GetAudioBySampleAsync(string path, long startSample, long sampleCount, int sampleRate)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return new AudioSampleResult { IsSuccessful = false, Chunk = null };
+            }
+
+            AudioSession session = GetOrCreateAudioSession(path);
+            AudioChunk? chunk = await session.GetAudioBySampleAsync(startSample, sampleCount, sampleRate).ConfigureAwait(false);
+            return new AudioSampleResult
+            {
+                IsSuccessful = chunk is not null,
+                Chunk = chunk,
+                ActualStartSample = startSample,
+                ActualSampleCount = (int)(chunk?.Length ?? 0),
+            };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"MediaFoundationPlugin: audio load by sample failed. path={path}, error={ex}");
+            return new AudioSampleResult { IsSuccessful = false, Chunk = null };
+        }
+    }
 
     public void Dispose()
     {
