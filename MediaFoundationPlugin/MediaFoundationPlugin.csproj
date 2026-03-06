@@ -13,14 +13,16 @@
   <ItemGroup>
     <Reference Include="Metasia.Editor.Plugin">
       <HintPath>$(MetasiaApplicationPath)\Metasia.Editor.Plugin.dll</HintPath>
+      <Private>false</Private>
     </Reference>
     <Reference Include="Metasia.Core">
       <HintPath>$(MetasiaApplicationPath)\Metasia.Core.dll</HintPath>
+      <Private>false</Private>
     </Reference>
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="SkiaSharp" Version="3.119.1" ExcludeAssets="runtime" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.2" />
   </ItemGroup>
 
