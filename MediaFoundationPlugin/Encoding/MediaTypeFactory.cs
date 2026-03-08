@@ -56,9 +56,8 @@ public sealed class MediaTypeFactory
         mediaType.Set(MediaTypeAttributeKeys.AudioSamplesPerSecond, _audioSampleRate);
         mediaType.Set(MediaTypeAttributeKeys.AudioNumChannels, _audioChannelCount);
         mediaType.Set(MediaTypeAttributeKeys.AudioBitsPerSample, _audioBitsPerSample);
-        mediaType.Set(MediaTypeAttributeKeys.AudioBlockAlignment, (short)(_audioChannelCount * _audioBitsPerSample / 8));
+        mediaType.Set(MediaTypeAttributeKeys.AudioBlockAlignment, _audioChannelCount * _audioBitsPerSample / 8);
         mediaType.Set(MediaTypeAttributeKeys.AudioAvgBytesPerSecond, _audioSampleRate * _audioChannelCount * _audioBitsPerSample / 8);
-        mediaType.Set(MediaTypeAttributeKeys.AllSamplesIndependent, 1);
         return mediaType;
     }
 
@@ -71,6 +70,9 @@ public sealed class MediaTypeFactory
         mediaType.Set(MediaTypeAttributeKeys.AudioNumChannels, _audioChannelCount);
         mediaType.Set(MediaTypeAttributeKeys.AudioBitsPerSample, 16);
         mediaType.Set(MediaTypeAttributeKeys.AudioAvgBytesPerSecond, _audioBitrate / 8);
+        mediaType.Set(MediaTypeAttributeKeys.AudioBlockAlignment, 1);
+        mediaType.Set(MediaTypeAttributeKeys.AvgBitrate, _audioBitrate);
+        mediaType.Set(MediaTypeAttributeKeys.AllSamplesIndependent, 0);
         return mediaType;
     }
 

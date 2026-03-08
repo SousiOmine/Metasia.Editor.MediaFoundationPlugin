@@ -207,8 +207,8 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
         _audioSessions.Clear();
     }
 
-    public EncoderBase CreateEncoderInstance()
+    public IMediaOutputSession CreateSession()
     {
-        return new MediaFoundationOutputEncoder();
+        return new MediaFoundationOutputSession();
     }
 }
