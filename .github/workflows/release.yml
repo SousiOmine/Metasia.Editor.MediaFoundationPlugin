@@ -1,0 +1,79 @@
+name: Release
+
+env:
+    PLUGIN_NAME: MediaFoundationPlugin
+    DOTNET_VERSION: 9.0.x
+
+on:
+    push:
+        tags: ['v*.*.*']
+
+jobs:
+    build:
+        name: Build (${{ matrix.rid }})
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                include:
+                    - os: windows-latest
+                      preset: windows-x64
+                      rid: win-x64
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 1
+
+            - name: Setup dotnet
+              uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: ${{ env.DOTNET_VERSION }}
+
+            - name: Extract version from tag
+              run: |
+                VERSION=${GITHUB_REF#refs/tags/v}
+                echo "VERSION=$VERSION" >> $GITHUB_ENV
+                perl -i -pe "s|<Version>.*</Version>|<Version>$VERSION</Version>|" Directory.Build.props
+                perl -i -pe "s|<AssemblyVersion>.*</AssemblyVersion>|<AssemblyVersion>${VERSION}.0</AssemblyVersion>|" Directory.Build.props
+                perl -i -pe "s|<FileVersion>.*</FileVersion>|<FileVersion>${VERSION}.0</FileVersion>|" Directory.Build.props
+              shell: bash
+
+            - name: Build
+              run: dotnet publish MediaFoundationPlugin -c Release -r ${{ matrix.rid }} --self-contained -o ./output
+
+            - name: Create release asset (Windows)
+              if: runner.os == 'Windows'
+              run: |
+                powershell Compress-Archive -Path 'output/*' -DestinationPath '${{ env.PLUGIN_NAME }}-${{ matrix.preset }}.zip'
+              shell: pwsh
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: ${{ env.PLUGIN_NAME }}-${{ matrix.preset }}
+                path: ${{ env.PLUGIN_NAME }}-${{ matrix.preset }}.zip
+
+    release:
+        name: Release
+        runs-on: ubuntu-latest
+        needs: build
+        permissions:
+            contents: write
+
+        steps:
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                path: release-assets
+
+            - name: Move release assets
+              run: |
+                mkdir -p upload
+                find release-assets -type f -name '*.zip' -exec cp {} upload/ \;
+              shell: bash
+
+            - name: Upload release assets
+              uses: softprops/action-gh-release@v2
+              with:
+                files: upload/*.zip
