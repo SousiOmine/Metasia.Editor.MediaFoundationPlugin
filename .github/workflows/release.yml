@@ -40,7 +40,7 @@ jobs:
               shell: bash
 
             - name: Build
-              run: dotnet publish MediaFoundationPlugin -c Release -r ${{ matrix.rid }} --self-contained -o ./output
+              run: dotnet publish MediaFoundationPlugin -c Release -r ${{ matrix.rid }} -o ./output
 
             - name: Create release asset (Windows)
               if: runner.os == 'Windows'
