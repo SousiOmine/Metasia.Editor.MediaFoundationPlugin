@@ -1,5 +1,5 @@
 <Project>
-    <PropertyGroup>
-        <MetasiaApplicationPath>C:\Users\mainpc_r7700\Documents\Code\Metasia-repos\Metasia\Metasia.Editor\bin\Debug\net9.0</MetasiaApplicationPath>
-    </PropertyGroup>
+  <PropertyGroup>
+    <UseLocalMetasiaSource>true</UseLocalMetasiaSource>
+  </PropertyGroup>
 </Project>
