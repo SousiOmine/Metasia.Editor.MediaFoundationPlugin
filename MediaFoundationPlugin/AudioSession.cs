@@ -74,7 +74,10 @@ internal sealed class AudioSession : IDisposable
 
             if (requestedDuration == long.MaxValue)
             {
-                _reader.SetCurrentPosition(Math.Max(startTimestamp, 0));
+                if (!TrySetPosition(Math.Max(startTimestamp, 0)))
+                {
+                    return null;
+                }
                 return ReadAudioSamplesAsRequestedFormat(startTimestamp, requestedDuration, sampleRate);
             }
 
@@ -96,7 +99,10 @@ internal sealed class AudioSession : IDisposable
             long windowStartTimestamp = Math.Max(0, startTimestamp - prerollTimestamp);
             long windowStartSample = Timestamp100nsToSample(windowStartTimestamp, sampleRate);
 
-            _reader.SetCurrentPosition(windowStartTimestamp);
+            if (!TrySetPosition(windowStartTimestamp))
+            {
+                return null;
+            }
             AudioChunk? windowChunk = ReadAudioSamplesAsRequestedFormat(windowStartTimestamp, windowDuration, sampleRate);
             if (windowChunk is null)
             {
@@ -501,6 +507,19 @@ internal sealed class AudioSession : IDisposable
         }
 
         return (long)Math.Round(scaled, MidpointRounding.AwayFromZero);
+    }
+
+    private bool TrySetPosition(long position)
+    {
+        try
+        {
+            _reader.SetCurrentPosition(position);
+            return true;
+        }
+        catch (SharpGen.Runtime.SharpGenException)
+        {
+            return false;
+        }
     }
 
     private sealed class AudioChunkCache(long startSample, int sampleRate, AudioChunk chunk)

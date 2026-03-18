@@ -86,7 +86,10 @@ internal sealed class VideoSession : IDisposable
             long targetTimestamp = TimestampUtility.ConvertToTimestamp100ns(requestTime);
             if (ShouldSeek(targetTimestamp))
             {
-                SeekTo(targetTimestamp);
+                if (!SeekTo(targetTimestamp))
+                {
+                    return null;
+                }
             }
 
             return ReadFrameAtOrAfter(targetTimestamp);
@@ -119,11 +122,20 @@ internal sealed class VideoSession : IDisposable
         return false;
     }
 
-    private void SeekTo(long targetTimestamp)
+    private bool SeekTo(long targetTimestamp)
     {
-        _reader.SetCurrentPosition(targetTimestamp);
-        _lastDecodedTimestamp = long.MinValue;
-        _endOfStream = false;
+        try
+        {
+            _reader.SetCurrentPosition(targetTimestamp);
+            _lastDecodedTimestamp = long.MinValue;
+            _endOfStream = false;
+            return true;
+        }
+        catch (SharpGen.Runtime.SharpGenException)
+        {
+            _endOfStream = true;
+            return false;
+        }
     }
 
     private SKImage? ReadFrameAtOrAfter(long targetTimestamp)

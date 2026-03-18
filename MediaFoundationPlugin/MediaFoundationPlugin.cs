@@ -11,7 +11,7 @@ namespace MediaFoundationPlugin;
 public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOutputPlugin, IDisposable
 {
     public string PluginIdentifier { get; } = "SousiOmine.MediaFoundationPlugin";
-    public string PluginVersion { get; } = "0.2.0";
+    public string PluginVersion { get; } = "0.2.1";
     public string PluginName { get; } = "MediaFoundation Input/Output";
 
     string IMediaOutputPlugin.Name => "MediaFoundation MP4";
