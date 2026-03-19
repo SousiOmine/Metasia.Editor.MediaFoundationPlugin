@@ -13,6 +13,8 @@ namespace MediaFoundationPlugin;
 
 public sealed class MediaFoundationOutputEncoder : EncoderBase
 {
+    private readonly record struct SinkWriterConfiguration(bool EnableHardwareTransforms, bool AddAudioStreamFirst);
+
     public string Name { get; } = "MediaFoundation MP4";
     public string[] SupportedExtensions { get; } = ["*.mp4"];
     public override double ProgressRate { get; protected set; }
@@ -29,6 +31,8 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
     private int _height;
     private double _framerate;
     private readonly MediaTypeFactory _mediaTypeFactory;
+    private AudioEncodingConfiguration? _activeAudioConfiguration;
+    private string? _workingOutputPath;
 
     public MediaFoundationOutputEncoder() : this(new MediaTypeFactory())
     {
@@ -114,11 +118,9 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            sinkWriter = CreateSinkWriter(_outputPath!);
-
             int videoStreamIndex;
             int audioStreamIndex;
-            ConfigureStreams(sinkWriter, _width, _height, _framerate, out videoStreamIndex, out audioStreamIndex);
+            sinkWriter = CreateConfiguredSinkWriter(_outputPath!, _width, _height, _framerate, out videoStreamIndex, out audioStreamIndex);
 
             sinkWriter.BeginWriting();
 
@@ -127,6 +129,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
             sinkWriter.Finalize();
             sinkWriter.Dispose();
+            CommitWorkingOutput();
 
             ProgressRate = 1.0;
             Status = IEncoder.EncoderState.Completed;
@@ -135,12 +138,14 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         }
         catch (OperationCanceledException)
         {
+            CleanupWorkingOutput();
             Status = IEncoder.EncoderState.Canceled;
             RaiseStatusChanged();
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"MediaFoundation MP4出力失敗: {ex}");
+            CleanupWorkingOutput();
             Status = IEncoder.EncoderState.Failed;
             RaiseStatusChanged();
             EncodeFailed.Invoke(this, EventArgs.Empty);
@@ -151,7 +156,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         }
     }
 
-    private IMFSinkWriter CreateSinkWriter(string outputPath)
+    private IMFSinkWriter CreateSinkWriter(string outputPath, bool enableHardwareTransforms)
     {
         var outputDirectory = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrWhiteSpace(outputDirectory))
@@ -159,24 +164,71 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             Directory.CreateDirectory(outputDirectory);
         }
 
-        using IMFAttributes attributes = MediaFactory.MFCreateAttributes(1);
-        attributes.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1);
+        if (enableHardwareTransforms)
+        {
+            using IMFAttributes attributes = MediaFactory.MFCreateAttributes(1);
+            attributes.Set(SinkWriterAttributeKeys.ReadwriteEnableHardwareTransforms, 1);
+            return MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, attributes);
+        }
 
-        return MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, attributes);
+        return MediaFactory.MFCreateSinkWriterFromURL(outputPath, null, null);
     }
 
-    private void ConfigureStreams(IMFSinkWriter sinkWriter, int width, int height, double framerate, out int videoStreamIndex, out int audioStreamIndex)
+    private IMFSinkWriter CreateConfiguredSinkWriter(string outputPath, int width, int height, double framerate, out int videoStreamIndex, out int audioStreamIndex)
+    {
+        Exception? lastException = null;
+        Debug.WriteLine($"MediaFoundation sink-writer setup started: width={width}, height={height}, framerate={framerate}");
+
+        foreach (var sinkWriterConfiguration in GetSinkWriterConfigurations())
+        {
+            foreach (var audioConfiguration in _mediaTypeFactory.GetAudioEncodingCandidates())
+            {
+                string candidateOutputPath = CreateCandidateOutputPath(outputPath);
+                IMFSinkWriter? sinkWriter = null;
+                try
+                {
+                    sinkWriter = CreateSinkWriter(candidateOutputPath, sinkWriterConfiguration.EnableHardwareTransforms);
+                    ConfigureStreams(sinkWriter, width, height, framerate, audioConfiguration, sinkWriterConfiguration, out videoStreamIndex, out audioStreamIndex);
+                    _activeAudioConfiguration = audioConfiguration;
+                    _workingOutputPath = candidateOutputPath;
+                    Debug.WriteLine($"MediaFoundation audio configuration selected: hw={sinkWriterConfiguration.EnableHardwareTransforms}, audioFirst={sinkWriterConfiguration.AddAudioStreamFirst}, sampleRate={audioConfiguration.SampleRate}, channels={audioConfiguration.ChannelCount}, bits={audioConfiguration.BitsPerSample}, bitrate={audioConfiguration.Bitrate}");
+                    return sinkWriter;
+                }
+                catch (Exception ex)
+                {
+                    sinkWriter?.Dispose();
+                    TryDeleteFile(candidateOutputPath);
+                    Debug.WriteLine($"MediaFoundation audio configuration rejected: hw={sinkWriterConfiguration.EnableHardwareTransforms}, audioFirst={sinkWriterConfiguration.AddAudioStreamFirst}, sampleRate={audioConfiguration.SampleRate}, channels={audioConfiguration.ChannelCount}, bits={audioConfiguration.BitsPerSample}, bitrate={audioConfiguration.Bitrate}, error={ex.Message}");
+                    lastException = ex;
+                }
+            }
+        }
+
+        throw new InvalidOperationException("有効なMedia Foundation音声設定を確立できませんでした。", lastException);
+    }
+
+    private void ConfigureStreams(IMFSinkWriter sinkWriter, int width, int height, double framerate, AudioEncodingConfiguration audioConfiguration, SinkWriterConfiguration sinkWriterConfiguration, out int videoStreamIndex, out int audioStreamIndex)
     {
         using IMFMediaType videoInputType = _mediaTypeFactory.CreateVideoInputMediaType(width, height, framerate);
         using IMFMediaType videoOutputType = _mediaTypeFactory.CreateVideoOutputMediaType(width, height, framerate);
-        using IMFMediaType audioInputType = _mediaTypeFactory.CreateAudioInputMediaType();
-        using IMFMediaType audioOutputType = _mediaTypeFactory.CreateAudioOutputMediaType();
+        using IMFMediaType audioInputType = _mediaTypeFactory.CreateAudioInputMediaType(audioConfiguration);
+        using IMFMediaType audioOutputType = _mediaTypeFactory.CreateAudioOutputMediaType(audioConfiguration);
+
+        if (sinkWriterConfiguration.AddAudioStreamFirst)
+        {
+            audioStreamIndex = sinkWriter.AddStream(audioOutputType);
+            videoStreamIndex = sinkWriter.AddStream(videoOutputType);
+
+            TrySetInputMediaType(sinkWriter, audioStreamIndex, audioInputType, "audio-input", audioConfiguration, width, height, framerate);
+            TrySetInputMediaType(sinkWriter, videoStreamIndex, videoInputType, "video-input", audioConfiguration, width, height, framerate);
+            return;
+        }
 
         videoStreamIndex = sinkWriter.AddStream(videoOutputType);
         audioStreamIndex = sinkWriter.AddStream(audioOutputType);
 
-        sinkWriter.SetInputMediaType(videoStreamIndex, videoInputType, null);
-        sinkWriter.SetInputMediaType(audioStreamIndex, audioInputType, null);
+        TrySetInputMediaType(sinkWriter, videoStreamIndex, videoInputType, "video-input", audioConfiguration, width, height, framerate);
+        TrySetInputMediaType(sinkWriter, audioStreamIndex, audioInputType, "audio-input", audioConfiguration, width, height, framerate);
     }
 
     private async Task WriteVideoFramesAsync(IMFSinkWriter sinkWriter, int streamIndex, double framerate, CancellationToken cancellationToken)
@@ -232,9 +284,11 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
     private async Task WriteAudioSamplesAsync(IMFSinkWriter sinkWriter, int streamIndex, CancellationToken cancellationToken)
     {
-        int sampleRate = _mediaTypeFactory.AudioSampleRate;
-        int channelCount = _mediaTypeFactory.AudioChannelCount;
-        int bitsPerSample = _mediaTypeFactory.AudioBitsPerSample;
+        AudioEncodingConfiguration audioConfiguration = _activeAudioConfiguration
+            ?? new AudioEncodingConfiguration(_mediaTypeFactory.AudioSampleRate, _mediaTypeFactory.AudioChannelCount, _mediaTypeFactory.AudioBitsPerSample, MediaFoundationOutputSettings.Default.AudioBitrate);
+        int sampleRate = audioConfiguration.SampleRate;
+        int channelCount = audioConfiguration.ChannelCount;
+        int bitsPerSample = audioConfiguration.BitsPerSample;
 
         long totalSamples = (long)Math.Ceiling((FrameCount / _framerate) * sampleRate);
         long samplesWritten = 0;
@@ -301,5 +355,117 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
     private void RaiseStatusChanged()
     {
         StatusChanged.Invoke(this, EventArgs.Empty);
+    }
+
+    private static IReadOnlyList<SinkWriterConfiguration> GetSinkWriterConfigurations()
+    {
+        return
+        [
+            new SinkWriterConfiguration(true, false),
+            new SinkWriterConfiguration(false, false),
+            new SinkWriterConfiguration(true, true),
+            new SinkWriterConfiguration(false, true)
+        ];
+    }
+
+    private static void TrySetInputMediaType(
+        IMFSinkWriter sinkWriter,
+        int streamIndex,
+        IMFMediaType mediaType,
+        string label,
+        AudioEncodingConfiguration audioConfiguration,
+        int width,
+        int height,
+        double framerate)
+    {
+        try
+        {
+            sinkWriter.SetInputMediaType(streamIndex, mediaType, null);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(
+                $"MediaFoundation SetInputMediaType failed: label={label}, streamIndex={streamIndex}, width={width}, height={height}, framerate={framerate}, audioSampleRate={audioConfiguration.SampleRate}, audioChannels={audioConfiguration.ChannelCount}, audioBits={audioConfiguration.BitsPerSample}, audioBitrate={audioConfiguration.Bitrate}, mediaType={DescribeMediaType(mediaType)}, error={ex}");
+            throw;
+        }
+    }
+
+    private static string DescribeMediaType(IMFMediaType mediaType)
+    {
+        static uint ReadUInt32(IMFMediaType type, Guid key)
+        {
+            return MediaFactory.MFGetAttributeUInt32(type, key, 0);
+        }
+
+        Guid majorType = mediaType.GetGUID(MediaTypeAttributeKeys.MajorType);
+        Guid subtype = mediaType.GetGUID(MediaTypeAttributeKeys.Subtype);
+        uint sampleRate = ReadUInt32(mediaType, MediaTypeAttributeKeys.AudioSamplesPerSecond);
+        uint channels = ReadUInt32(mediaType, MediaTypeAttributeKeys.AudioNumChannels);
+        uint bitsPerSample = ReadUInt32(mediaType, MediaTypeAttributeKeys.AudioBitsPerSample);
+        uint avgBytesPerSecond = ReadUInt32(mediaType, MediaTypeAttributeKeys.AudioAvgBytesPerSecond);
+
+        uint width = 0;
+        uint height = 0;
+        if (MediaFactory.MFGetAttributeSize(mediaType, MediaTypeAttributeKeys.FrameSize, out width, out height).Success)
+        {
+            return $"major={majorType}, subtype={subtype}, frameSize={width}x{height}, audioRate={sampleRate}, audioChannels={channels}, audioBits={bitsPerSample}, audioAvgBytes={avgBytesPerSecond}";
+        }
+
+        return $"major={majorType}, subtype={subtype}, audioRate={sampleRate}, audioChannels={channels}, audioBits={bitsPerSample}, audioAvgBytes={avgBytesPerSecond}";
+    }
+
+    private string CreateCandidateOutputPath(string finalOutputPath)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "Metasia.MediaFoundation");
+        Directory.CreateDirectory(directory);
+        string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(finalOutputPath);
+        string extension = Path.GetExtension(finalOutputPath);
+        string candidate = Path.Combine(directory, $"{fileNameWithoutExtension}.mf-{Guid.NewGuid():N}{extension}");
+        TryDeleteFile(candidate);
+        return candidate;
+    }
+
+    private void CommitWorkingOutput()
+    {
+        if (string.IsNullOrWhiteSpace(_workingOutputPath) || string.IsNullOrWhiteSpace(_outputPath))
+        {
+            return;
+        }
+
+        if (File.Exists(_outputPath))
+        {
+            File.Delete(_outputPath);
+        }
+
+        File.Move(_workingOutputPath, _outputPath);
+        _workingOutputPath = null;
+    }
+
+    private void CleanupWorkingOutput()
+    {
+        if (string.IsNullOrWhiteSpace(_workingOutputPath))
+        {
+            return;
+        }
+
+        TryDeleteFile(_workingOutputPath);
+        _workingOutputPath = null;
+    }
+
+    private static void TryDeleteFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"MediaFoundation temporary file cleanup failed: path={path}, error={ex.Message}");
+        }
     }
 }

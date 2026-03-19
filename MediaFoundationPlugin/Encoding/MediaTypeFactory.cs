@@ -1,6 +1,12 @@
 using Vortice.MediaFoundation;
+using Vortice.Multimedia;
 
 namespace MediaFoundationPlugin.Encoding;
+
+public sealed record AudioEncodingConfiguration(int SampleRate, int ChannelCount, int BitsPerSample, int Bitrate)
+{
+    public int AvgBytesPerSecond => Bitrate / 8;
+}
 
 public sealed class MediaTypeFactory
 {
@@ -19,8 +25,8 @@ public sealed class MediaTypeFactory
     {
         _audioSampleRate = audioSampleRate;
         _audioChannelCount = audioChannelCount;
-        _audioBitsPerSample = audioBitsPerSample;
-        _audioBitrate = audioBitrate;
+        _audioBitsPerSample = NormalizeAudioBitsPerSample(audioBitsPerSample);
+        _audioBitrate = MediaFoundationOutputSettings.NormalizeAudioBitrate(audioBitrate);
         _videoBitrate = videoBitrate;
     }
 
@@ -48,35 +54,56 @@ public sealed class MediaTypeFactory
         return mediaType;
     }
 
-    public IMFMediaType CreateAudioInputMediaType()
+    public IMFMediaType CreateAudioInputMediaType(AudioEncodingConfiguration configuration)
+    {
+        WaveFormat waveFormat = new(configuration.SampleRate, configuration.BitsPerSample, configuration.ChannelCount);
+        return MediaFactory.MFCreateAudioMediaType(ref waveFormat);
+    }
+
+    public IMFMediaType CreateAudioOutputMediaType(AudioEncodingConfiguration configuration)
     {
         IMFMediaType mediaType = MediaFactory.MFCreateMediaType();
         mediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Audio);
-        mediaType.Set(MediaTypeAttributeKeys.Subtype, EncodingConstants.AudioFormatPcm);
-        mediaType.Set(MediaTypeAttributeKeys.AudioSamplesPerSecond, _audioSampleRate);
-        mediaType.Set(MediaTypeAttributeKeys.AudioNumChannels, _audioChannelCount);
-        mediaType.Set(MediaTypeAttributeKeys.AudioBitsPerSample, _audioBitsPerSample);
-        mediaType.Set(MediaTypeAttributeKeys.AudioBlockAlignment, _audioChannelCount * _audioBitsPerSample / 8);
-        mediaType.Set(MediaTypeAttributeKeys.AudioAvgBytesPerSecond, _audioSampleRate * _audioChannelCount * _audioBitsPerSample / 8);
+        mediaType.Set(MediaTypeAttributeKeys.Subtype, AudioFormatGuids.Aac);
+        mediaType.Set(MediaTypeAttributeKeys.AudioSamplesPerSecond, configuration.SampleRate);
+        mediaType.Set(MediaTypeAttributeKeys.AudioNumChannels, configuration.ChannelCount);
+        mediaType.Set(MediaTypeAttributeKeys.AudioBitsPerSample, configuration.BitsPerSample);
+        mediaType.Set(MediaTypeAttributeKeys.AudioAvgBytesPerSecond, configuration.AvgBytesPerSecond);
         return mediaType;
     }
 
-    public IMFMediaType CreateAudioOutputMediaType()
+    public IReadOnlyList<AudioEncodingConfiguration> GetAudioEncodingCandidates()
     {
-        IMFMediaType mediaType = MediaFactory.MFCreateMediaType();
-        mediaType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Audio);
-        mediaType.Set(MediaTypeAttributeKeys.Subtype, EncodingConstants.AudioFormatAac);
-        mediaType.Set(MediaTypeAttributeKeys.AudioSamplesPerSecond, _audioSampleRate);
-        mediaType.Set(MediaTypeAttributeKeys.AudioNumChannels, _audioChannelCount);
-        mediaType.Set(MediaTypeAttributeKeys.AudioBitsPerSample, 16);
-        mediaType.Set(MediaTypeAttributeKeys.AudioAvgBytesPerSecond, _audioBitrate / 8);
-        mediaType.Set(MediaTypeAttributeKeys.AudioBlockAlignment, 1);
-        mediaType.Set(MediaTypeAttributeKeys.AvgBitrate, _audioBitrate);
-        mediaType.Set(MediaTypeAttributeKeys.AllSamplesIndependent, 0);
-        return mediaType;
+        var sampleRates = new[] { _audioSampleRate, 44100, 48000 }
+            .Where(sampleRate => sampleRate is 44100 or 48000)
+            .Distinct()
+            .ToArray();
+
+        var bitrates = MediaFoundationOutputSettings.SupportedAudioBitrates
+            .OrderBy(bitrate => bitrate == _audioBitrate ? -1 : 0)
+            .ThenBy(bitrate => Math.Abs(bitrate - _audioBitrate))
+            .ToArray();
+
+        List<AudioEncodingConfiguration> candidates = [];
+        foreach (int sampleRate in sampleRates)
+        {
+            foreach (int bitrate in bitrates)
+            {
+                candidates.Add(new AudioEncodingConfiguration(sampleRate, _audioChannelCount, _audioBitsPerSample, bitrate));
+            }
+        }
+
+        return candidates;
     }
 
     public int AudioSampleRate => _audioSampleRate;
     public int AudioChannelCount => _audioChannelCount;
     public int AudioBitsPerSample => _audioBitsPerSample;
+
+    private static int NormalizeAudioBitsPerSample(int audioBitsPerSample)
+    {
+        return audioBitsPerSample == EncodingConstants.AudioBitsPerSample
+            ? audioBitsPerSample
+            : EncodingConstants.AudioBitsPerSample;
+    }
 }
