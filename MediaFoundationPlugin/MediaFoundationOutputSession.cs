@@ -5,8 +5,8 @@ namespace MediaFoundationPlugin;
 
 public sealed class MediaFoundationOutputSession : IMediaOutputSession
 {
-    public string Name => "MediaFoundation MP4";
-    public string[] SupportedExtensions => ["*.mp4"];
+    public string Name => MediaFoundationOutputFormatInfo.DisplayName;
+    public string[] SupportedExtensions => MediaFoundationOutputFormatInfo.SupportedExtensions;
     public Avalonia.Controls.Control? SettingsView { get; }
 
     private readonly MediaFoundationOutputSettingsViewModel _viewModel;
@@ -26,7 +26,7 @@ public sealed class MediaFoundationOutputSession : IMediaOutputSession
         var mediaTypeFactory = new MediaTypeFactory(
             audioBitrate: settings.AudioBitrate,
             videoBitrate: settings.VideoBitrate);
-        return new MediaFoundationOutputEncoder(mediaTypeFactory);
+        return new MediaFoundationOutputEncoder(mediaTypeFactory, settings);
     }
 
     public void Dispose()

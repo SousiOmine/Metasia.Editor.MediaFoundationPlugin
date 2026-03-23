@@ -14,8 +14,8 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
     public string PluginVersion { get; } = "0.2.2";
     public string PluginName { get; } = "MediaFoundation Input/Output";
 
-    string IMediaOutputPlugin.Name => "MediaFoundation MP4";
-    string[] IMediaOutputPlugin.SupportedExtensions => ["*.mp4"];
+    string IMediaOutputPlugin.Name => MediaFoundationOutputFormatInfo.DisplayName;
+    string[] IMediaOutputPlugin.SupportedExtensions => MediaFoundationOutputFormatInfo.SupportedExtensions;
 
     public IEnumerable<IEditorPlugin.SupportEnvironment> SupportedEnvironments { get; } =
     [
