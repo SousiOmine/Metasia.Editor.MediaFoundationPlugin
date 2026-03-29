@@ -170,8 +170,9 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             Directory.CreateDirectory(outputDirectory);
         }
 
-        using IMFAttributes attributes = MediaFactory.MFCreateAttributes((uint)(enableHardwareTransforms ? 2 : 1));
+        using IMFAttributes attributes = MediaFactory.MFCreateAttributes(3);
         attributes.Set(TranscodeAttributeKeys.TranscodeContainertype, GetContainerTypeFromPath(outputPath));
+        attributes.Set(SinkWriterAttributeKeys.DisableThrottling, 1);
 
         if (enableHardwareTransforms)
         {
