@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Metasia.Core.Encode;
 using Metasia.Core.Media;
 using Metasia.Core.Sounds;
+using Metasia.Editor.Abstractions.Hosting;
 using Metasia.Editor.Plugin;
 using SkiaSharp;
 
@@ -11,7 +12,7 @@ namespace MediaFoundationPlugin;
 public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOutputPlugin, IDisposable
 {
     public string PluginIdentifier { get; } = "SousiOmine.MediaFoundationPlugin";
-    public string PluginVersion { get; } = "0.2.2";
+    public string PluginVersion { get; } = "0.3.0";
     public string PluginName { get; } = "MediaFoundation Input/Output";
 
     string IMediaOutputPlugin.Name => MediaFoundationOutputFormatInfo.DisplayName;
@@ -27,7 +28,7 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
     private readonly ConcurrentDictionary<string, AudioSession> _audioSessions = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
-    public void Initialize()
+    public void Initialize(IEditorHostContext hostContext)
     {
         MediaFoundationLifecycle.EnsureStarted();
     }
