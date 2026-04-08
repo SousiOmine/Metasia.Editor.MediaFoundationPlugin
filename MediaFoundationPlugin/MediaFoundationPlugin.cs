@@ -12,7 +12,7 @@ namespace MediaFoundationPlugin;
 public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOutputPlugin, IDisposable
 {
     public string PluginIdentifier { get; } = "SousiOmine.MediaFoundationPlugin";
-    public string PluginVersion { get; } = "0.3.0";
+    public string PluginVersion { get; } = "0.4.0";
     public string PluginName { get; } = "MediaFoundation Input/Output";
 
     string IMediaOutputPlugin.Name => MediaFoundationOutputFormatInfo.DisplayName;
