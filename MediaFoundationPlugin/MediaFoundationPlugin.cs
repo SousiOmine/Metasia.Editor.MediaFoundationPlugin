@@ -27,6 +27,8 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
     private readonly ConcurrentDictionary<string, VideoSession> _videoSessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, AudioSession> _audioSessions = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
+    private long _lastCleanupTicks;
+    private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(30);
 
     public void Initialize(IEditorHostContext hostContext)
     {
@@ -180,12 +182,48 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
 
     private VideoSession GetOrCreateVideoSession(string path)
     {
-        return _videoSessions.GetOrAdd(path, static p => new VideoSession(p));
+        VideoSession session = _videoSessions.GetOrAdd(path, static p => new VideoSession(p));
+        CleanupSessionsIfNeeded();
+        return session;
     }
 
     private AudioSession GetOrCreateAudioSession(string path)
     {
-        return _audioSessions.GetOrAdd(path, static p => new AudioSession(p));
+        AudioSession session = _audioSessions.GetOrAdd(path, static p => new AudioSession(p));
+        CleanupSessionsIfNeeded();
+        return session;
+    }
+
+    private void CleanupSessionsIfNeeded()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        if (now - _lastCleanupTicks < CleanupInterval.Ticks)
+            return;
+
+        _lastCleanupTicks = now;
+        long cutoffTicks = now - CleanupInterval.Ticks;
+
+        foreach (var kvp in _videoSessions)
+        {
+            if (kvp.Value.LastAccessTicks < cutoffTicks)
+            {
+                if (_videoSessions.TryRemove(kvp.Key, out VideoSession? session))
+                {
+                    session.Dispose();
+                }
+            }
+        }
+
+        foreach (var kvp in _audioSessions)
+        {
+            if (kvp.Value.LastAccessTicks < cutoffTicks)
+            {
+                if (_audioSessions.TryRemove(kvp.Key, out AudioSession? session))
+                {
+                    session.Dispose();
+                }
+            }
+        }
     }
 
     private void DisposeVideoSessions()

@@ -19,6 +19,8 @@ internal sealed class AudioSession : IDisposable
     private bool _disposed;
     private AudioChunkCache? _cache;
 
+    internal long LastAccessTicks;
+
     public AudioSession(string path)
     {
         _reader = SourceReaderFactory.CreateAudioReader(path, out int sampleRate, out int channelCount, out _);
@@ -61,6 +63,7 @@ internal sealed class AudioSession : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, nameof(AudioSession));
+            LastAccessTicks = DateTime.UtcNow.Ticks;
 
             if (startSample < 0)
             {

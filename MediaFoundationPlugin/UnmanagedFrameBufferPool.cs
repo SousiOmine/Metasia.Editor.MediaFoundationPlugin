@@ -1,11 +1,10 @@
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 
 namespace MediaFoundationPlugin;
 
 internal sealed class UnmanagedFrameBufferPool : IDisposable
 {
-    private readonly ConcurrentBag<IntPtr> _buffers = new();
+    private readonly Stack<IntPtr> _buffers = new();
     private readonly int _bufferSizeBytes;
     private readonly int _maxRetainedBuffers;
     private int _retainedCount;
@@ -27,10 +26,10 @@ internal sealed class UnmanagedFrameBufferPool : IDisposable
         lock (_buffers)
         {
             ObjectDisposedException.ThrowIf(_disposed, nameof(UnmanagedFrameBufferPool));
-            if (_buffers.TryTake(out IntPtr buffer))
+            if (_buffers.Count > 0)
             {
                 _retainedCount--;
-                return buffer;
+                return _buffers.Pop();
             }
         }
 
@@ -58,7 +57,7 @@ internal sealed class UnmanagedFrameBufferPool : IDisposable
                 return;
             }
 
-            _buffers.Add(buffer);
+            _buffers.Push(buffer);
             _retainedCount++;
         }
     }
@@ -73,9 +72,9 @@ internal sealed class UnmanagedFrameBufferPool : IDisposable
             }
 
             _disposed = true;
-            while (_buffers.TryTake(out IntPtr buffer))
+            while (_buffers.Count > 0)
             {
-                Marshal.FreeHGlobal(buffer);
+                Marshal.FreeHGlobal(_buffers.Pop());
                 _retainedCount--;
             }
         }

@@ -7,6 +7,7 @@ namespace MediaFoundationPlugin;
 internal sealed class VideoSession : IDisposable
 {
     private const int MaxRetainedBuffers = 4;
+    private const int MaxCachedFrames = 10;
     private static readonly TimeSpan MinimumSeekJumpThreshold = TimeSpan.FromMilliseconds(900);
     private static readonly SKImageRasterReleaseDelegate ReleasePixelBuffer = static (pixels, context) =>
     {
@@ -35,6 +36,11 @@ internal sealed class VideoSession : IDisposable
     private long _lastDecodedTimestamp = long.MinValue;
     private bool _endOfStream;
     private bool _disposed;
+
+    private readonly Dictionary<long, SKImage> _frameCache = new();
+    private readonly Queue<long> _cacheTimestampQueue = new();
+
+    internal long LastAccessTicks;
 
     public VideoSession(string path)
     {
@@ -72,6 +78,7 @@ internal sealed class VideoSession : IDisposable
             _disposed = true;
             _reader.Dispose();
             _pixelBufferPool.Dispose();
+            ClearCache();
         }
 
         GC.SuppressFinalize(this);
@@ -82,8 +89,15 @@ internal sealed class VideoSession : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, nameof(VideoSession));
+            LastAccessTicks = DateTime.UtcNow.Ticks;
 
             long targetTimestamp = TimestampUtility.ConvertToTimestamp100ns(requestTime);
+
+            if (_frameCache.TryGetValue(targetTimestamp, out SKImage? cached))
+            {
+                return CloneSKImage(cached);
+            }
+
             if (ShouldSeek(targetTimestamp))
             {
                 if (!SeekTo(targetTimestamp))
@@ -92,7 +106,16 @@ internal sealed class VideoSession : IDisposable
                 }
             }
 
-            return ReadFrameAtOrAfter(targetTimestamp);
+            SKImage? frame = ReadFrameAtOrAfter(targetTimestamp);
+            if (frame is not null)
+            {
+                SKImage cacheEntry = CloneSKImage(frame);
+                if (cacheEntry is not null)
+                {
+                    AddToCache(targetTimestamp, cacheEntry);
+                }
+            }
+            return frame;
         }
     }
 
@@ -124,6 +147,7 @@ internal sealed class VideoSession : IDisposable
 
     private bool SeekTo(long targetTimestamp)
     {
+        ClearCache();
         try
         {
             _reader.SetCurrentPosition(targetTimestamp);
@@ -196,6 +220,51 @@ internal sealed class VideoSession : IDisposable
     {
         int bufferSize = checked(format.DestinationStride * format.Height);
         return new UnmanagedFrameBufferPool(bufferSize, MaxRetainedBuffers);
+    }
+
+    private void AddToCache(long timestamp, SKImage frame)
+    {
+        if (_cacheTimestampQueue.Count >= MaxCachedFrames)
+        {
+            long oldestTimestamp = _cacheTimestampQueue.Dequeue();
+            if (_frameCache.Remove(oldestTimestamp, out SKImage? evicted))
+            {
+                evicted.Dispose();
+            }
+        }
+        _cacheTimestampQueue.Enqueue(timestamp);
+        _frameCache[timestamp] = frame;
+    }
+
+    private void ClearCache()
+    {
+        foreach (SKImage image in _frameCache.Values)
+        {
+            image.Dispose();
+        }
+        _frameCache.Clear();
+        _cacheTimestampQueue.Clear();
+    }
+
+    private static SKImage CloneSKImage(SKImage source)
+    {
+        var info = source.Info;
+        int rowBytes = info.RowBytes;
+        int size = info.BytesSize;
+        IntPtr pixels = Marshal.AllocHGlobal(size);
+        try
+        {
+            source.ReadPixels(info, pixels, rowBytes, 0, 0);
+        }
+        catch
+        {
+            Marshal.FreeHGlobal(pixels);
+            throw;
+        }
+
+        using var pixmap = new SKPixmap(info, pixels, rowBytes);
+        SKImage image = SKImage.FromPixels(pixmap, static (p, _) => Marshal.FreeHGlobal(p), null);
+        return image;
     }
 
     private static SKImage? ConvertSampleToSkImage(IMFSample sample, VideoFormat format, UnmanagedFrameBufferPool pixelBufferPool)
