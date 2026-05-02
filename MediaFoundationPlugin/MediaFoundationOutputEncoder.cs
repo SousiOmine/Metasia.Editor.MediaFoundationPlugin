@@ -135,7 +135,10 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
             sinkWriter.Finalize();
             sinkWriter.Dispose();
+
+            SetProgress(0.92);
             CommitWorkingOutput();
+            SetProgress(1.0);
 
             ProgressRate = 1.0;
             Status = IEncoder.EncoderState.Completed;
@@ -278,7 +281,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
             currentTimestamp += frameDuration100ns;
             frameIndex++;
-            SetProgress(0.5 * frameIndex / FrameCount);
+            SetProgress(0.35 * frameIndex / FrameCount);
         }
     }
 
@@ -368,7 +371,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             currentSamplePosition += chunk.Length;
             samplesWritten += chunk.Length;
 
-            double progress = 0.5 + 0.5 * samplesWritten / totalSamples;
+            double progress = 0.35 + 0.45 * samplesWritten / totalSamples;
             SetProgress(progress);
         }
     }
