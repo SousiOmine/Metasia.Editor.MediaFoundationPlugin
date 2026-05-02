@@ -182,15 +182,17 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
 
     private VideoSession GetOrCreateVideoSession(string path)
     {
-        VideoSession session = _videoSessions.GetOrAdd(path, static p => new VideoSession(p));
         CleanupSessionsIfNeeded();
+        VideoSession session = _videoSessions.GetOrAdd(path, static p => new VideoSession(p));
+        session.Touch();
         return session;
     }
 
     private AudioSession GetOrCreateAudioSession(string path)
     {
-        AudioSession session = _audioSessions.GetOrAdd(path, static p => new AudioSession(p));
         CleanupSessionsIfNeeded();
+        AudioSession session = _audioSessions.GetOrAdd(path, static p => new AudioSession(p));
+        session.Touch();
         return session;
     }
 
@@ -209,7 +211,14 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
             {
                 if (_videoSessions.TryRemove(kvp.Key, out VideoSession? session))
                 {
-                    session.Dispose();
+                    if (session.LastAccessTicks < cutoffTicks)
+                    {
+                        session.Dispose();
+                    }
+                    else
+                    {
+                        _videoSessions.TryAdd(kvp.Key, session);
+                    }
                 }
             }
         }
@@ -220,7 +229,14 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
             {
                 if (_audioSessions.TryRemove(kvp.Key, out AudioSession? session))
                 {
-                    session.Dispose();
+                    if (session.LastAccessTicks < cutoffTicks)
+                    {
+                        session.Dispose();
+                    }
+                    else
+                    {
+                        _audioSessions.TryAdd(kvp.Key, session);
+                    }
                 }
             }
         }

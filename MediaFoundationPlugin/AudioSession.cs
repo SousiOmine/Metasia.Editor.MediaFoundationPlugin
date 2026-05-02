@@ -14,6 +14,7 @@ internal sealed class AudioSession : IDisposable
 
     private readonly object _sync = new();
     private readonly IMFSourceReader _reader;
+    private readonly AudioReaderFormat _readerFormat;
     private readonly int _readerSampleRate;
     private readonly int _readerChannelCount;
     private bool _disposed;
@@ -23,9 +24,15 @@ internal sealed class AudioSession : IDisposable
 
     public AudioSession(string path)
     {
-        _reader = SourceReaderFactory.CreateAudioReader(path, out int sampleRate, out int channelCount, out _);
-        _readerSampleRate = sampleRate > 0 ? sampleRate : 44100;
-        _readerChannelCount = channelCount > 0 ? channelCount : TargetChannelCount;
+        _reader = SourceReaderFactory.CreateAudioReader(path, out _readerFormat, out _);
+        _readerSampleRate = _readerFormat.SampleRate > 0 ? _readerFormat.SampleRate : 44100;
+        _readerChannelCount = _readerFormat.ChannelCount > 0 ? _readerFormat.ChannelCount : TargetChannelCount;
+        Touch();
+    }
+
+    internal void Touch()
+    {
+        LastAccessTicks = DateTime.UtcNow.Ticks;
     }
 
     public Task<AudioChunk?> GetAudioAsync(TimeSpan? startTime, TimeSpan? duration)
@@ -62,8 +69,8 @@ internal sealed class AudioSession : IDisposable
     {
         lock (_sync)
         {
-            ObjectDisposedException.ThrowIf(_disposed, nameof(AudioSession));
-            LastAccessTicks = DateTime.UtcNow.Ticks;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            Touch();
 
             if (startSample < 0)
             {
@@ -184,6 +191,7 @@ internal sealed class AudioSession : IDisposable
         int channels = channelCount;
         long nextExpectedFrame = 0;
         bool hasExpectedFrame = false;
+        bool decodedSampleSeen = false;
 
         while (true)
         {
@@ -211,12 +219,13 @@ internal sealed class AudioSession : IDisposable
                     continue;
                 }
 
-                float[]? audioData = ExtractAudioData(sample);
+                double[]? audioData = ExtractAudioData(sample, _readerFormat);
                 if (audioData is null || audioData.Length == 0)
                 {
                     continue;
                 }
 
+                decodedSampleSeen = true;
                 int sampleFrames = audioData.Length / channels;
                 if (sampleFrames <= 0)
                 {
@@ -257,12 +266,12 @@ internal sealed class AudioSession : IDisposable
             }
         }
 
-        return output;
+        return decodedSampleSeen ? output : null;
     }
 
     private AudioChunk? ReadAudioSamplesUnbounded(long startTimestamp, int sampleRate, int channelCount)
     {
-        var sampleBuffers = new List<float[]>();
+        var sampleBuffers = new List<double[]>();
         int totalSamples = 0;
         int channels = channelCount;
         long nextExpectedFrame = 0;
@@ -289,7 +298,7 @@ internal sealed class AudioSession : IDisposable
                     continue;
                 }
 
-                float[]? audioData = ExtractAudioData(sample);
+                double[]? audioData = ExtractAudioData(sample, _readerFormat);
                 if (audioData is null || audioData.Length == 0)
                 {
                     continue;
@@ -326,13 +335,13 @@ internal sealed class AudioSession : IDisposable
                 }
 
                 int copySamples = copyFrames * channels;
-                var trimmed = new float[copySamples];
+                var trimmed = new double[copySamples];
                 Buffer.BlockCopy(
                     audioData,
-                    sourceStartFrame * channels * sizeof(float),
+                    sourceStartFrame * channels * sizeof(double),
                     trimmed,
                     0,
-                    copySamples * sizeof(float));
+                    copySamples * sizeof(double));
                 sampleBuffers.Add(trimmed);
                 totalSamples += copySamples;
             }
@@ -343,7 +352,7 @@ internal sealed class AudioSession : IDisposable
             : CreateAudioChunk(sampleBuffers, totalSamples, sampleRate, channelCount);
     }
 
-    private static float[]? ExtractAudioData(IMFSample sample)
+    private static double[]? ExtractAudioData(IMFSample sample, AudioReaderFormat format)
     {
         using IMFMediaBuffer buffer = sample.ConvertToContiguousBuffer();
         using BufferLockContext lockContext = BufferHelper.LockBuffer(buffer);
@@ -353,29 +362,102 @@ internal sealed class AudioSession : IDisposable
             return null;
         }
 
-        int sampleCount = lockContext.CurrentLength / sizeof(float);
-        var audioData = new float[sampleCount];
-        Marshal.Copy(lockContext.Data, audioData, 0, sampleCount);
-        return audioData;
+        if (format.Subtype == AudioFormatGuids.Float && format.BitsPerSample == 32)
+        {
+            return ExtractFloat32AudioData(lockContext.Data, lockContext.CurrentLength);
+        }
+
+        if (format.Subtype != AudioFormatGuids.Pcm)
+        {
+            return null;
+        }
+
+        return format.BitsPerSample switch
+        {
+            16 => ExtractPcm16AudioData(lockContext.Data, lockContext.CurrentLength),
+            24 => ExtractPcm24AudioData(lockContext.Data, lockContext.CurrentLength),
+            32 => ExtractPcm32AudioData(lockContext.Data, lockContext.CurrentLength),
+            _ => null,
+        };
     }
 
-    private static AudioChunk CreateAudioChunk(List<float[]> sampleBuffers, int totalSamples, int sampleRate, int channelCount)
+    private static double[] ExtractFloat32AudioData(IntPtr data, int byteLength)
+    {
+        int sampleCount = byteLength / sizeof(float);
+        var floatSamples = new float[sampleCount];
+        Marshal.Copy(data, floatSamples, 0, sampleCount);
+
+        var samples = new double[sampleCount];
+        for (int i = 0; i < sampleCount; i++)
+        {
+            samples[i] = floatSamples[i];
+        }
+
+        return samples;
+    }
+
+    private static double[] ExtractPcm16AudioData(IntPtr data, int byteLength)
+    {
+        int sampleCount = byteLength / sizeof(short);
+        var samples = new double[sampleCount];
+        for (int i = 0; i < sampleCount; i++)
+        {
+            short value = Marshal.ReadInt16(data, i * sizeof(short));
+            samples[i] = value / 32768.0;
+        }
+
+        return samples;
+    }
+
+    private static double[] ExtractPcm24AudioData(IntPtr data, int byteLength)
+    {
+        int sampleCount = byteLength / 3;
+        var samples = new double[sampleCount];
+        for (int i = 0; i < sampleCount; i++)
+        {
+            int offset = i * 3;
+            int value =
+                Marshal.ReadByte(data, offset) |
+                (Marshal.ReadByte(data, offset + 1) << 8) |
+                (Marshal.ReadByte(data, offset + 2) << 16);
+            if ((value & 0x800000) != 0)
+            {
+                value |= unchecked((int)0xFF000000);
+            }
+
+            samples[i] = value / 8388608.0;
+        }
+
+        return samples;
+    }
+
+    private static double[] ExtractPcm32AudioData(IntPtr data, int byteLength)
+    {
+        int sampleCount = byteLength / sizeof(int);
+        var samples = new double[sampleCount];
+        for (int i = 0; i < sampleCount; i++)
+        {
+            int value = Marshal.ReadInt32(data, i * sizeof(int));
+            samples[i] = value / 2147483648.0;
+        }
+
+        return samples;
+    }
+
+    private static AudioChunk CreateAudioChunk(List<double[]> sampleBuffers, int totalSamples, int sampleRate, int channelCount)
     {
         var samples = new double[totalSamples];
         int offset = 0;
-        foreach (float[] buffer in sampleBuffers)
+        foreach (double[] buffer in sampleBuffers)
         {
-            for (int i = 0; i < buffer.Length; i++)
-            {
-                samples[offset + i] = buffer[i];
-            }
+            Buffer.BlockCopy(buffer, 0, samples, offset * sizeof(double), buffer.Length * sizeof(double));
             offset += buffer.Length;
         }
 
         return new AudioChunk(new AudioFormat(sampleRate, channelCount), samples);
     }
 
-    private static void CopyInterleavedFrames(float[] source, int sourceStartFrame, double[] destination, long destinationStartFrame, int frameCount, int channels)
+    private static void CopyInterleavedFrames(double[] source, int sourceStartFrame, double[] destination, long destinationStartFrame, int frameCount, int channels)
     {
         int sourceStartIndex = sourceStartFrame * channels;
         int destinationStartIndex = checked((int)(destinationStartFrame * channels));

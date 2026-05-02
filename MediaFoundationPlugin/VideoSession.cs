@@ -48,6 +48,12 @@ internal sealed class VideoSession : IDisposable
         _pixelBufferPool = CreatePixelBufferPool(_format);
         _frameDurationTicks100ns = TimestampUtility.ResolveFrameDurationTicks100ns(_fps);
         _seekJumpThresholdTicks100ns = Math.Max(_frameDurationTicks100ns * 45L, MinimumSeekJumpThreshold.Ticks);
+        Touch();
+    }
+
+    internal void Touch()
+    {
+        LastAccessTicks = DateTime.UtcNow.Ticks;
     }
 
     public Task<SKImage?> GetFrameAsync(TimeSpan time)
@@ -88,8 +94,8 @@ internal sealed class VideoSession : IDisposable
     {
         lock (_sync)
         {
-            ObjectDisposedException.ThrowIf(_disposed, nameof(VideoSession));
-            LastAccessTicks = DateTime.UtcNow.Ticks;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            Touch();
 
             long targetTimestamp = TimestampUtility.ConvertToTimestamp100ns(requestTime);
 
