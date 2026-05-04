@@ -1,5 +1,7 @@
 using System.Runtime.InteropServices;
 using Metasia.Core.Sounds;
+using SharpGen.Runtime;
+using SharpGen.Runtime.Win32;
 using Vortice.MediaFoundation;
 
 namespace MediaFoundationPlugin;
@@ -9,7 +11,7 @@ internal sealed class AudioSession : IDisposable
     private const int TargetChannelCount = 2;
     private const int TimestampJitterToleranceFrames = 2;
     private const long HundredNanosecondsPerSecond = 10_000_000;
-    private const long CacheWindowSamples = 176400;
+    private const long CacheWindowSamples = 441000;
     private const long CachePrerollSamples = 6615;
 
     private readonly object _sync = new();
@@ -21,6 +23,28 @@ internal sealed class AudioSession : IDisposable
     private AudioChunkCache? _cache;
 
     internal long LastAccessTicks;
+    internal int SampleRate => _readerSampleRate;
+    internal int Channels => _readerChannelCount;
+    internal TimeSpan Duration
+    {
+        get
+        {
+            try
+            {
+                Variant durationVariant = _reader.GetPresentationAttribute(
+                    SourceReaderIndex.MediaSource,
+                    PresentationDescriptionAttributeKeys.Duration);
+                if (MediaFoundationDuration.TryConvertDuration100ns(durationVariant.Value, out TimeSpan duration))
+                {
+                    return duration;
+                }
+            }
+            catch
+            {
+            }
+            return TimeSpan.Zero;
+        }
+    }
 
     public AudioSession(string path)
     {

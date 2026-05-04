@@ -166,6 +166,62 @@ public sealed partial class MediaFoundationPlugin : IMediaInputPlugin, IMediaOut
         }
     }
 
+    public Task<VideoMediaInfoResult?> GetVideoMediaInfoAsync(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return Task.FromResult<VideoMediaInfoResult?>(null);
+            }
+
+            if (!SourceReaderFactory.FileHasVideoStream(path))
+            {
+                return Task.FromResult<VideoMediaInfoResult?>(null);
+            }
+
+            VideoSession session = GetOrCreateVideoSession(path);
+            return Task.FromResult<VideoMediaInfoResult?>(new VideoMediaInfoResult
+            {
+                IsSuccessful = true,
+                Duration = session.Duration,
+                Width = session.Width,
+                Height = session.Height,
+                FrameRate = session.Fps,
+            });
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"MediaFoundationPlugin: get video info failed. path={path}, error={ex}");
+            return Task.FromResult<VideoMediaInfoResult?>(null);
+        }
+    }
+
+    public Task<AudioMediaInfoResult?> GetAudioMediaInfoAsync(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return Task.FromResult<AudioMediaInfoResult?>(null);
+            }
+
+            AudioSession session = GetOrCreateAudioSession(path);
+            return Task.FromResult<AudioMediaInfoResult?>(new AudioMediaInfoResult
+            {
+                IsSuccessful = true,
+                Duration = session.Duration,
+                SampleRate = session.SampleRate,
+                Channels = session.Channels,
+            });
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"MediaFoundationPlugin: get audio info failed. path={path}, error={ex}");
+            return Task.FromResult<AudioMediaInfoResult?>(null);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed)

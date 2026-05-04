@@ -11,6 +11,21 @@ internal static class SourceReaderFactory
     private const int DefaultAudioChannelCount = 2;
     private const int DefaultPcmBitsPerSample = 16;
 
+    public static bool FileHasVideoStream(string path)
+    {
+        using IMFAttributes attributes = MediaFactory.MFCreateAttributes(1u);
+        using IMFSourceReader reader = MediaFactory.MFCreateSourceReaderFromURL(path, attributes);
+        try
+        {
+            reader.GetNativeMediaType(SourceReaderIndex.FirstVideoStream, 0);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static IMFSourceReader CreateVideoReader(string path, bool useOptimizedPipeline, out VideoFormat format, out double fps)
     {
         try
@@ -95,9 +110,9 @@ internal static class SourceReaderFactory
             try
             {
                 Variant durationVariant = reader.GetPresentationAttribute(SourceReaderIndex.MediaSource, PresentationDescriptionAttributeKeys.Duration);
-                if (durationVariant.Value is long durationValue)
+                if (MediaFoundationDuration.TryConvertDuration100ns(durationVariant.Value, out TimeSpan duration))
                 {
-                    duration100ns = durationValue;
+                    duration100ns = duration.Ticks;
                 }
             }
             catch (Exception ex)

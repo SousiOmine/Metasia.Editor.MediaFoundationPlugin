@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using SharpGen.Runtime;
+using SharpGen.Runtime.Win32;
 using SkiaSharp;
 using Vortice.MediaFoundation;
 
@@ -41,6 +43,29 @@ internal sealed class VideoSession : IDisposable
     private readonly Queue<long> _cacheTimestampQueue = new();
 
     internal long LastAccessTicks;
+    internal double Fps => _fps;
+    internal int Width => _format.Width;
+    internal int Height => _format.Height;
+    internal TimeSpan Duration
+    {
+        get
+        {
+            try
+            {
+                Variant durationVariant = _reader.GetPresentationAttribute(
+                    SourceReaderIndex.MediaSource,
+                    PresentationDescriptionAttributeKeys.Duration);
+                if (MediaFoundationDuration.TryConvertDuration100ns(durationVariant.Value, out TimeSpan duration))
+                {
+                    return duration;
+                }
+            }
+            catch
+            {
+            }
+            return TimeSpan.Zero;
+        }
+    }
 
     public VideoSession(string path)
     {
