@@ -123,28 +123,46 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
     private async Task EncodeAsync(CancellationToken cancellationToken)
     {
+        var encodeSw = Stopwatch.StartNew();
         IMFSinkWriter? sinkWriter = null;
 
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Start] frames={FrameCount} source={_sourceWidth}x{_sourceHeight} output={_outputWidth}x{_outputHeight} framerate={_framerate}");
+
             int videoStreamIndex;
             int audioStreamIndex;
+            var setupSw = Stopwatch.StartNew();
             sinkWriter = CreateConfiguredSinkWriter(_outputPath!, _outputWidth, _outputHeight, _framerate, out videoStreamIndex, out audioStreamIndex);
+            setupSw.Stop();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [SinkWriter-Setup] time={setupSw.ElapsedMilliseconds}ms");
 
             sinkWriter.BeginWriting();
 
+            var videoSw = Stopwatch.StartNew();
             await WriteVideoFramesAsync(sinkWriter, videoStreamIndex, _framerate, cancellationToken).ConfigureAwait(false);
-            await WriteAudioSamplesAsync(sinkWriter, audioStreamIndex, cancellationToken).ConfigureAwait(false);
+            videoSw.Stop();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Video-Write] time={videoSw.ElapsedMilliseconds}ms");
 
+            var audioSw = Stopwatch.StartNew();
+            await WriteAudioSamplesAsync(sinkWriter, audioStreamIndex, cancellationToken).ConfigureAwait(false);
+            audioSw.Stop();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Audio-Write] time={audioSw.ElapsedMilliseconds}ms");
+
+            var finalizeSw = Stopwatch.StartNew();
             sinkWriter.Finalize();
             sinkWriter.Dispose();
+            finalizeSw.Stop();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [SinkWriter-Finalize] time={finalizeSw.ElapsedMilliseconds}ms");
 
             SetProgress(0.92);
             CommitWorkingOutput();
             SetProgress(1.0);
 
+            var totalMs = encodeSw.ElapsedMilliseconds;
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Completed] totalTime={totalMs}ms setupTime={setupSw.ElapsedMilliseconds}ms videoTime={videoSw.ElapsedMilliseconds}ms audioTime={audioSw.ElapsedMilliseconds}ms finalizeTime={finalizeSw.ElapsedMilliseconds}ms");
             ProgressRate = 1.0;
             Status = IEncoder.EncoderState.Completed;
             RaiseStatusChanged();
@@ -155,9 +173,11 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             CleanupWorkingOutput();
             Status = IEncoder.EncoderState.Canceled;
             RaiseStatusChanged();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Canceled] elapsedTime={encodeSw.ElapsedMilliseconds}ms");
         }
         catch (Exception ex)
         {
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Failed] elapsedTime={encodeSw.ElapsedMilliseconds}ms error={ex.Message}");
             Debug.WriteLine($"MediaFoundation出力失敗: {ex}");
             CleanupWorkingOutput();
             Status = IEncoder.EncoderState.Failed;
@@ -268,19 +288,29 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
     {
         long frameDuration100ns = (long)(EncodingConstants.HundredNanosecondsPerSecond / framerate);
         long currentTimestamp = 0;
+        var frameSw = Stopwatch.StartNew();
 
         int frameIndex = 0;
         await foreach (var frame in GetFramesAsync(0, FrameCount - 1, cancellationToken).ConfigureAwait(false))
         {
             using (frame)
             {
+                var nv12Sw = Stopwatch.StartNew();
                 IMFSample? sample = CreateVideoSampleFromSkImage(frame, _outputWidth, _outputHeight, frameDuration100ns, currentTimestamp);
+                nv12Sw.Stop();
+
                 if (sample is not null)
                 {
                     using (sample)
                     {
                         sinkWriter.WriteSample(streamIndex, sample);
                     }
+                }
+
+                if (frameIndex % 30 == 0 || frameIndex == FrameCount - 1)
+                {
+                    var elapsedMs = frameSw.ElapsedMilliseconds;
+                    Debug.WriteLine($"[MediaFoundation] [Perf] [Frame-Render] frame={frameIndex + 1}/{FrameCount} elapsedMs={elapsedMs}ms avgMs={elapsedMs / (double)(frameIndex + 1):F2}ms fps={(frameIndex + 1) / (elapsedMs / 1000.0):F1} nv12ConvertMs={nv12Sw.Elapsed.TotalMilliseconds:F2}ms");
                 }
             }
 
@@ -345,10 +375,13 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         long totalSamples = (long)Math.Ceiling((FrameCount / _framerate) * sampleRate);
         long samplesWritten = 0;
         long currentSamplePosition = 0;
+        var audioSw = Stopwatch.StartNew();
+        int chunkIndex = 0;
 
         while (currentSamplePosition < totalSamples)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var chunkSw = Stopwatch.StartNew();
 
             long chunkSampleCount = Math.Min(1024 * 10, totalSamples - currentSamplePosition);
 
@@ -358,6 +391,8 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
                 sampleRate,
                 channelCount,
                 cancellationToken).ConfigureAwait(false);
+
+            var getAudioMs = chunkSw.ElapsedMilliseconds;
 
             if (chunk.Length <= 0)
             {
@@ -375,6 +410,12 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
             currentSamplePosition += chunk.Length;
             samplesWritten += chunk.Length;
+            chunkIndex++;
+
+            if (chunkIndex % 5 == 0 || currentSamplePosition >= totalSamples)
+            {
+                Debug.WriteLine($"[MediaFoundation] [Perf] [Audio-Chunk] chunk={chunkIndex} samples={currentSamplePosition}/{totalSamples} getAudioMs={getAudioMs}ms chunkTotalMs={chunkSw.ElapsedMilliseconds}ms");
+            }
 
             double progress = 0.35 + 0.45 * samplesWritten / totalSamples;
             SetProgress(progress);
