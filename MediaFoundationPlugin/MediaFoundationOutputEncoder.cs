@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Metasia.Core.Encode;
 using Metasia.Core.Media;
 using Metasia.Core.Objects;
@@ -36,7 +35,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
     private readonly MediaFoundationOutputSettings _settings;
     private AudioEncodingConfiguration? _activeAudioConfiguration;
     private string? _workingOutputPath;
-    private UnmanagedFrameBufferPool? _nv12Pool;
+    private SKBitmap? _scratchBitmap;
 
     public MediaFoundationOutputEncoder() : this(new MediaTypeFactory(), MediaFoundationOutputSettings.Default)
     {
@@ -70,8 +69,8 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             throw new ArgumentOutOfRangeException(nameof(project), "フレームレートは0より大きい必要があります。");
         }
 
-        _nv12Pool?.Dispose();
-        _nv12Pool = new UnmanagedFrameBufferPool(Nv12Converter.CalculateNv12BufferSize(_outputWidth, _outputHeight));
+        _scratchBitmap?.Dispose();
+        _scratchBitmap = null;
     }
 
     public override void Start()
@@ -115,7 +114,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         {
             _cts.Cancel();
             _cts.Dispose();
-            _nv12Pool?.Dispose();
+            _scratchBitmap?.Dispose();
         }
 
         base.Dispose(disposing);
@@ -320,48 +319,71 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         }
     }
 
-    private unsafe IMFSample? CreateVideoSampleFromSkImage(SKImage image, int outputWidth, int outputHeight, long duration100ns, long timestamp100ns)
+    private IMFSample? CreateVideoSampleFromSkImage(SKImage image, int outputWidth, int outputHeight, long duration100ns, long timestamp100ns)
     {
-        using var bitmap = CreateOutputBitmap(image, outputWidth, outputHeight);
-        if (bitmap is null)
-        {
-            return null;
-        }
-
         int totalSize = Nv12Converter.CalculateNv12BufferSize(outputWidth, outputHeight);
 
-        IntPtr nv12Buffer = _nv12Pool!.Rent();
-        try
+        using SKPixmap pixmap = image.PeekPixels();
+        if (pixmap is not null &&
+            pixmap.Width == outputWidth &&
+            pixmap.Height == outputHeight &&
+            IsSupportedDirectPixelFormat(pixmap.ColorType))
         {
-            Nv12Converter.ConvertBgraToNv12InPlace(bitmap, nv12Buffer);
+            return MediaSampleBuilder.CreateSampleWithWritableBuffer(
+                totalSize,
+                timestamp100ns,
+                duration100ns,
+                (destination, _) => Nv12Converter.ConvertToNv12InPlace(
+                    pixmap.GetPixels(),
+                    outputWidth,
+                    outputHeight,
+                    pixmap.RowBytes,
+                    pixmap.ColorType,
+                    destination));
+        }
 
-            return MediaSampleBuilder.CreateSampleFromBuffer(nv12Buffer, totalSize, timestamp100ns, duration100ns);
-        }
-        finally
-        {
-            _nv12Pool.Return(nv12Buffer);
-        }
+        SKBitmap bitmap = CreateOutputBitmap(image, outputWidth, outputHeight);
+        return MediaSampleBuilder.CreateSampleWithWritableBuffer(
+            totalSize,
+            timestamp100ns,
+            duration100ns,
+            (destination, _) => Nv12Converter.ConvertToNv12InPlace(bitmap, destination));
     }
 
-    private static SKBitmap? CreateOutputBitmap(SKImage image, int outputWidth, int outputHeight)
+    private SKBitmap CreateOutputBitmap(SKImage image, int outputWidth, int outputHeight)
     {
-        using var sourceBitmap = SKBitmap.FromImage(image);
-        if (sourceBitmap is null)
+        SKBitmap bitmap = GetOrCreateScratchBitmap(outputWidth, outputHeight);
+        if (image.Width == outputWidth && image.Height == outputHeight)
         {
-            return null;
+            using var pixmap = bitmap.PeekPixels();
+            if (pixmap is not null && image.ReadPixels(pixmap))
+            {
+                return bitmap;
+            }
         }
 
-        if (sourceBitmap.Width == outputWidth && sourceBitmap.Height == outputHeight)
-        {
-            return sourceBitmap.Copy();
-        }
-
-        var scaledBitmap = new SKBitmap(new SKImageInfo(outputWidth, outputHeight, SKColorType.Bgra8888, SKAlphaType.Premul));
-        using var canvas = new SKCanvas(scaledBitmap);
+        using var canvas = new SKCanvas(bitmap);
         canvas.Clear(SKColors.Black);
         canvas.DrawImage(image, new SKRect(0, 0, outputWidth, outputHeight), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
         canvas.Flush();
-        return scaledBitmap;
+        return bitmap;
+    }
+
+    private SKBitmap GetOrCreateScratchBitmap(int width, int height)
+    {
+        if (_scratchBitmap is not null && _scratchBitmap.Width == width && _scratchBitmap.Height == height)
+        {
+            return _scratchBitmap;
+        }
+
+        _scratchBitmap?.Dispose();
+        _scratchBitmap = new SKBitmap(new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+        return _scratchBitmap;
+    }
+
+    private static bool IsSupportedDirectPixelFormat(SKColorType colorType)
+    {
+        return colorType is SKColorType.Bgra8888 or SKColorType.Rgba8888;
     }
 
     private async Task WriteAudioSamplesAsync(IMFSinkWriter sinkWriter, int streamIndex, CancellationToken cancellationToken)
