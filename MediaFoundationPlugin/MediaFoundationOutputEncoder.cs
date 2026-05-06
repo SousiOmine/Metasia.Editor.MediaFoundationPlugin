@@ -36,6 +36,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
     private readonly MediaFoundationOutputSettings _settings;
     private AudioEncodingConfiguration? _activeAudioConfiguration;
     private string? _workingOutputPath;
+    private UnmanagedFrameBufferPool? _nv12Pool;
 
     public MediaFoundationOutputEncoder() : this(new MediaTypeFactory(), MediaFoundationOutputSettings.Default)
     {
@@ -68,6 +69,9 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         {
             throw new ArgumentOutOfRangeException(nameof(project), "フレームレートは0より大きい必要があります。");
         }
+
+        _nv12Pool?.Dispose();
+        _nv12Pool = new UnmanagedFrameBufferPool(Nv12Converter.CalculateNv12BufferSize(_outputWidth, _outputHeight));
     }
 
     public override void Start()
@@ -111,6 +115,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         {
             _cts.Cancel();
             _cts.Dispose();
+            _nv12Pool?.Dispose();
         }
 
         base.Dispose(disposing);
@@ -295,7 +300,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
         int totalSize = Nv12Converter.CalculateNv12BufferSize(outputWidth, outputHeight);
 
-        IntPtr nv12Buffer = Marshal.AllocHGlobal(totalSize);
+        IntPtr nv12Buffer = _nv12Pool!.Rent();
         try
         {
             Nv12Converter.ConvertBgraToNv12InPlace(bitmap, nv12Buffer);
@@ -304,7 +309,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         }
         finally
         {
-            Marshal.FreeHGlobal(nv12Buffer);
+            _nv12Pool.Return(nv12Buffer);
         }
     }
 
