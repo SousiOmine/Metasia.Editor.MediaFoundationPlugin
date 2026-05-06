@@ -12,7 +12,15 @@ namespace MediaFoundationPlugin;
 
 public sealed class MediaFoundationOutputEncoder : EncoderBase
 {
+    private const int AudioChunkSampleCount = 1024 * 10;
+
     private readonly record struct SinkWriterConfiguration(bool EnableHardwareTransforms, bool AddAudioStreamFirst);
+    private readonly record struct VideoSampleTiming(double PixelMs, double FallbackMs, double ConvertMs, double SampleMs);
+    private sealed class AudioWriteState
+    {
+        public long CurrentSamplePosition { get; set; }
+        public int ChunkIndex { get; set; }
+    }
 
     public string Name { get; } = MediaFoundationOutputFormatInfo.DisplayName;
     public string[] SupportedExtensions { get; } = MediaFoundationOutputFormatInfo.SupportedExtensions;
@@ -140,15 +148,10 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
 
             sinkWriter.BeginWriting();
 
-            var videoSw = Stopwatch.StartNew();
-            await WriteVideoFramesAsync(sinkWriter, videoStreamIndex, _framerate, cancellationToken).ConfigureAwait(false);
-            videoSw.Stop();
-            Debug.WriteLine($"[MediaFoundation] [Perf] [Video-Write] time={videoSw.ElapsedMilliseconds}ms");
-
-            var audioSw = Stopwatch.StartNew();
-            await WriteAudioSamplesAsync(sinkWriter, audioStreamIndex, cancellationToken).ConfigureAwait(false);
-            audioSw.Stop();
-            Debug.WriteLine($"[MediaFoundation] [Perf] [Audio-Write] time={audioSw.ElapsedMilliseconds}ms");
+            var mediaSw = Stopwatch.StartNew();
+            await WriteInterleavedSamplesAsync(sinkWriter, videoStreamIndex, audioStreamIndex, _framerate, cancellationToken).ConfigureAwait(false);
+            mediaSw.Stop();
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Media-Write] time={mediaSw.ElapsedMilliseconds}ms");
 
             var finalizeSw = Stopwatch.StartNew();
             sinkWriter.Finalize();
@@ -161,7 +164,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             SetProgress(1.0);
 
             var totalMs = encodeSw.ElapsedMilliseconds;
-            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Completed] totalTime={totalMs}ms setupTime={setupSw.ElapsedMilliseconds}ms videoTime={videoSw.ElapsedMilliseconds}ms audioTime={audioSw.ElapsedMilliseconds}ms finalizeTime={finalizeSw.ElapsedMilliseconds}ms");
+            Debug.WriteLine($"[MediaFoundation] [Perf] [Encode-Completed] totalTime={totalMs}ms setupTime={setupSw.ElapsedMilliseconds}ms mediaTime={mediaSw.ElapsedMilliseconds}ms finalizeTime={finalizeSw.ElapsedMilliseconds}ms");
             ProgressRate = 1.0;
             Status = IEncoder.EncoderState.Completed;
             RaiseStatusChanged();
@@ -197,9 +200,8 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
             Directory.CreateDirectory(outputDirectory);
         }
 
-        using IMFAttributes attributes = MediaFactory.MFCreateAttributes(3);
+        using IMFAttributes attributes = MediaFactory.MFCreateAttributes(2);
         attributes.Set(TranscodeAttributeKeys.TranscodeContainertype, GetContainerTypeFromPath(outputPath));
-        attributes.Set(SinkWriterAttributeKeys.DisableThrottling, 1);
 
         if (enableHardwareTransforms)
         {
@@ -283,71 +285,145 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         TrySetInputMediaType(sinkWriter, audioStreamIndex, audioInputType, "audio-input", audioConfiguration, width, height, framerate);
     }
 
-    private async Task WriteVideoFramesAsync(IMFSinkWriter sinkWriter, int streamIndex, double framerate, CancellationToken cancellationToken)
+    private async Task WriteInterleavedSamplesAsync(IMFSinkWriter sinkWriter, int videoStreamIndex, int audioStreamIndex, double framerate, CancellationToken cancellationToken)
     {
+        AudioEncodingConfiguration audioConfiguration = _activeAudioConfiguration
+            ?? new AudioEncodingConfiguration(_mediaTypeFactory.AudioSampleRate, _mediaTypeFactory.AudioChannelCount, _mediaTypeFactory.AudioBitsPerSample, MediaFoundationOutputSettings.Default.AudioBitrate);
+        int sampleRate = audioConfiguration.SampleRate;
+        int channelCount = audioConfiguration.ChannelCount;
+        int bitsPerSample = audioConfiguration.BitsPerSample;
+        long totalAudioSamples = (long)Math.Ceiling((FrameCount / framerate) * sampleRate);
+        var audioState = new AudioWriteState();
+
         long frameDuration100ns = (long)(EncodingConstants.HundredNanosecondsPerSecond / framerate);
         long currentTimestamp = 0;
         var frameSw = Stopwatch.StartNew();
 
         int frameIndex = 0;
-        await foreach (var frame in GetFramesAsync(0, FrameCount - 1, cancellationToken).ConfigureAwait(false))
+        await using var frameEnumerator = GetFramesAsync(0, FrameCount - 1, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        while (true)
         {
+            var getFrameSw = Stopwatch.StartNew();
+            if (!await frameEnumerator.MoveNextAsync().ConfigureAwait(false))
+            {
+                break;
+            }
+
+            getFrameSw.Stop();
+            SKImage frame = frameEnumerator.Current;
+            double writeMs = 0;
+            VideoSampleTiming sampleTiming = default;
+
             using (frame)
             {
-                var nv12Sw = Stopwatch.StartNew();
-                IMFSample? sample = CreateVideoSampleFromSkImage(frame, _outputWidth, _outputHeight, frameDuration100ns, currentTimestamp);
-                nv12Sw.Stop();
+                IMFSample? sample = CreateVideoSampleFromSkImage(frame, _outputWidth, _outputHeight, frameDuration100ns, currentTimestamp, out sampleTiming);
 
                 if (sample is not null)
                 {
                     using (sample)
                     {
-                        sinkWriter.WriteSample(streamIndex, sample);
+                        var writeSw = Stopwatch.StartNew();
+                        sinkWriter.WriteSample(videoStreamIndex, sample);
+                        writeSw.Stop();
+                        writeMs = writeSw.Elapsed.TotalMilliseconds;
                     }
                 }
 
                 if (frameIndex % 30 == 0 || frameIndex == FrameCount - 1)
                 {
                     var elapsedMs = frameSw.ElapsedMilliseconds;
-                    Debug.WriteLine($"[MediaFoundation] [Perf] [Frame-Render] frame={frameIndex + 1}/{FrameCount} elapsedMs={elapsedMs}ms avgMs={elapsedMs / (double)(frameIndex + 1):F2}ms fps={(frameIndex + 1) / (elapsedMs / 1000.0):F1} nv12ConvertMs={nv12Sw.Elapsed.TotalMilliseconds:F2}ms");
+                    Debug.WriteLine($"[MediaFoundation] [Perf] [Frame-Render] frame={frameIndex + 1}/{FrameCount} elapsedMs={elapsedMs}ms avgMs={elapsedMs / (double)(frameIndex + 1):F2}ms fps={(frameIndex + 1) / (elapsedMs / 1000.0):F1} getFrameMs={getFrameSw.Elapsed.TotalMilliseconds:F2}ms sampleMs={sampleTiming.SampleMs:F2}ms pixelMs={sampleTiming.PixelMs:F2}ms fallbackMs={sampleTiming.FallbackMs:F2}ms nv12ConvertMs={sampleTiming.ConvertMs:F2}ms writeMs={writeMs:F2}ms");
                 }
+            }
+
+            long videoEndSample = (long)Math.Ceiling((frameIndex + 1) * sampleRate / framerate);
+            if (audioState.CurrentSamplePosition < videoEndSample)
+            {
+                long audioTargetSample = Math.Min(totalAudioSamples, videoEndSample + AudioChunkSampleCount);
+                await WriteAudioSamplesUntilAsync(
+                    sinkWriter,
+                    audioStreamIndex,
+                    audioTargetSample,
+                    totalAudioSamples,
+                    sampleRate,
+                    channelCount,
+                    bitsPerSample,
+                    cancellationToken,
+                    audioState).ConfigureAwait(false);
             }
 
             currentTimestamp += frameDuration100ns;
             frameIndex++;
-            SetProgress(0.35 * frameIndex / FrameCount);
+            SetProgress(0.8 * frameIndex / FrameCount);
         }
+
+        await WriteAudioSamplesUntilAsync(
+            sinkWriter,
+            audioStreamIndex,
+            totalAudioSamples,
+            totalAudioSamples,
+            sampleRate,
+            channelCount,
+            bitsPerSample,
+            cancellationToken,
+            audioState).ConfigureAwait(false);
     }
 
-    private IMFSample? CreateVideoSampleFromSkImage(SKImage image, int outputWidth, int outputHeight, long duration100ns, long timestamp100ns)
+    private IMFSample? CreateVideoSampleFromSkImage(SKImage image, int outputWidth, int outputHeight, long duration100ns, long timestamp100ns, out VideoSampleTiming timing)
     {
         int totalSize = Nv12Converter.CalculateNv12BufferSize(outputWidth, outputHeight);
 
+        var pixelSw = Stopwatch.StartNew();
         using SKPixmap pixmap = image.PeekPixels();
+        pixelSw.Stop();
         if (pixmap is not null &&
             pixmap.Width == outputWidth &&
             pixmap.Height == outputHeight &&
             IsSupportedDirectPixelFormat(pixmap.ColorType))
         {
-            return MediaSampleBuilder.CreateSampleWithWritableBuffer(
+            double convertMs = 0;
+            var sampleSw = Stopwatch.StartNew();
+            IMFSample sample = MediaSampleBuilder.CreateSampleWithWritableBuffer(
                 totalSize,
                 timestamp100ns,
                 duration100ns,
-                (destination, _) => Nv12Converter.ConvertToNv12InPlace(
-                    pixmap.GetPixels(),
-                    outputWidth,
-                    outputHeight,
-                    pixmap.RowBytes,
-                    pixmap.ColorType,
-                    destination));
+                (destination, _) =>
+                {
+                    var convertSw = Stopwatch.StartNew();
+                    Nv12Converter.ConvertToNv12InPlace(
+                        pixmap.GetPixels(),
+                        outputWidth,
+                        outputHeight,
+                        pixmap.RowBytes,
+                        pixmap.ColorType,
+                        destination);
+                    convertSw.Stop();
+                    convertMs = convertSw.Elapsed.TotalMilliseconds;
+                });
+            sampleSw.Stop();
+            timing = new VideoSampleTiming(pixelSw.Elapsed.TotalMilliseconds, 0, convertMs, sampleSw.Elapsed.TotalMilliseconds);
+            return sample;
         }
 
+        var fallbackSw = Stopwatch.StartNew();
         SKBitmap bitmap = CreateOutputBitmap(image, outputWidth, outputHeight);
-        return MediaSampleBuilder.CreateSampleWithWritableBuffer(
+        fallbackSw.Stop();
+        double fallbackConvertMs = 0;
+        var fallbackSampleSw = Stopwatch.StartNew();
+        IMFSample fallbackSample = MediaSampleBuilder.CreateSampleWithWritableBuffer(
             totalSize,
             timestamp100ns,
             duration100ns,
-            (destination, _) => Nv12Converter.ConvertToNv12InPlace(bitmap, destination));
+            (destination, _) =>
+            {
+                var convertSw = Stopwatch.StartNew();
+                Nv12Converter.ConvertToNv12InPlace(bitmap, destination);
+                convertSw.Stop();
+                fallbackConvertMs = convertSw.Elapsed.TotalMilliseconds;
+            });
+        fallbackSampleSw.Stop();
+        timing = new VideoSampleTiming(pixelSw.Elapsed.TotalMilliseconds, fallbackSw.Elapsed.TotalMilliseconds, fallbackConvertMs, fallbackSampleSw.Elapsed.TotalMilliseconds);
+        return fallbackSample;
     }
 
     private SKBitmap CreateOutputBitmap(SKImage image, int outputWidth, int outputHeight)
@@ -386,29 +462,27 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
         return colorType is SKColorType.Bgra8888 or SKColorType.Rgba8888;
     }
 
-    private async Task WriteAudioSamplesAsync(IMFSinkWriter sinkWriter, int streamIndex, CancellationToken cancellationToken)
+    private async Task WriteAudioSamplesUntilAsync(
+        IMFSinkWriter sinkWriter,
+        int streamIndex,
+        long targetSamplePosition,
+        long totalSamples,
+        int sampleRate,
+        int channelCount,
+        int bitsPerSample,
+        CancellationToken cancellationToken,
+        AudioWriteState state)
     {
-        AudioEncodingConfiguration audioConfiguration = _activeAudioConfiguration
-            ?? new AudioEncodingConfiguration(_mediaTypeFactory.AudioSampleRate, _mediaTypeFactory.AudioChannelCount, _mediaTypeFactory.AudioBitsPerSample, MediaFoundationOutputSettings.Default.AudioBitrate);
-        int sampleRate = audioConfiguration.SampleRate;
-        int channelCount = audioConfiguration.ChannelCount;
-        int bitsPerSample = audioConfiguration.BitsPerSample;
-
-        long totalSamples = (long)Math.Ceiling((FrameCount / _framerate) * sampleRate);
-        long samplesWritten = 0;
-        long currentSamplePosition = 0;
-        var audioSw = Stopwatch.StartNew();
-        int chunkIndex = 0;
-
-        while (currentSamplePosition < totalSamples)
+        targetSamplePosition = Math.Min(targetSamplePosition, totalSamples);
+        while (state.CurrentSamplePosition < targetSamplePosition)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var chunkSw = Stopwatch.StartNew();
 
-            long chunkSampleCount = Math.Min(1024 * 10, totalSamples - currentSamplePosition);
+            long chunkSampleCount = Math.Min(AudioChunkSampleCount, targetSamplePosition - state.CurrentSamplePosition);
 
             var chunk = await GetAudioChunkAsync(
-                currentSamplePosition,
+                state.CurrentSamplePosition,
                 chunkSampleCount,
                 sampleRate,
                 channelCount,
@@ -421,7 +495,7 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
                 break;
             }
 
-            IMFSample? audioSample = CreateAudioSampleFromChunk(chunk, currentSamplePosition, sampleRate, channelCount, bitsPerSample);
+            IMFSample? audioSample = CreateAudioSampleFromChunk(chunk, state.CurrentSamplePosition, sampleRate, channelCount, bitsPerSample);
             if (audioSample is not null)
             {
                 using (audioSample)
@@ -430,17 +504,13 @@ public sealed class MediaFoundationOutputEncoder : EncoderBase
                 }
             }
 
-            currentSamplePosition += chunk.Length;
-            samplesWritten += chunk.Length;
-            chunkIndex++;
+            state.CurrentSamplePosition += chunk.Length;
+            state.ChunkIndex++;
 
-            if (chunkIndex % 5 == 0 || currentSamplePosition >= totalSamples)
+            if (state.ChunkIndex % 5 == 0 || state.CurrentSamplePosition >= totalSamples)
             {
-                Debug.WriteLine($"[MediaFoundation] [Perf] [Audio-Chunk] chunk={chunkIndex} samples={currentSamplePosition}/{totalSamples} getAudioMs={getAudioMs}ms chunkTotalMs={chunkSw.ElapsedMilliseconds}ms");
+                Debug.WriteLine($"[MediaFoundation] [Perf] [Audio-Chunk] chunk={state.ChunkIndex} samples={state.CurrentSamplePosition}/{totalSamples} getAudioMs={getAudioMs}ms chunkTotalMs={chunkSw.ElapsedMilliseconds}ms");
             }
-
-            double progress = 0.35 + 0.45 * samplesWritten / totalSamples;
-            SetProgress(progress);
         }
     }
 

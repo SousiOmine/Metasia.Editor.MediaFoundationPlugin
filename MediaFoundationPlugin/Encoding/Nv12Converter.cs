@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SkiaSharp;
@@ -7,6 +8,16 @@ namespace MediaFoundationPlugin.Encoding;
 internal static class Nv12Converter
 {
     private const int ParallelPixelThreshold = 1_000_000;
+    private const int ParallelRowPairChunkSize = 64;
+    private static readonly int[] YR = CreateTable(66, 0);
+    private static readonly int[] YG = CreateTable(129, 0);
+    private static readonly int[] YB = CreateTable(25, 128 + (16 << 8));
+    private static readonly int[] UR = CreateTable(-38, 0);
+    private static readonly int[] UG = CreateTable(-74, 0);
+    private static readonly int[] UB = CreateTable(112, 128 + (128 << 8));
+    private static readonly int[] VR = CreateTable(112, 0);
+    private static readonly int[] VG = CreateTable(-94, 0);
+    private static readonly int[] VB = CreateTable(-18, 128 + (128 << 8));
 
     public static IntPtr ConvertBgraToNv12(SKBitmap bitmap)
     {
@@ -99,10 +110,9 @@ internal static class Nv12Converter
         nint yAddress = (nint)yPlane;
         nint uvAddress = (nint)uvPlane;
 
-        Parallel.For(
-            0,
-            height / 2,
-            pairY => ConvertRows((byte*)srcAddress, (byte*)yAddress, (byte*)uvAddress, width, height, rowBytes, rgba, pairY, pairY + 1));
+        Parallel.ForEach(
+            Partitioner.Create(0, height / 2, ParallelRowPairChunkSize),
+            range => ConvertRows((byte*)srcAddress, (byte*)yAddress, (byte*)uvAddress, width, height, rowBytes, rgba, range.Item1, range.Item2));
     }
 
     private static unsafe void ConvertRows(byte* src, byte* yPlane, byte* uvPlane, int width, int height, int rowBytes, bool rgba, int pairStart, int pairEnd)
@@ -116,62 +126,96 @@ internal static class Nv12Converter
             byte* yRow1 = yRow0 + width;
             byte* uvRow = uvPlane + pairY * width;
 
-            ConvertYRow(row0, yRow0, width, rgba);
-            ConvertYRow(row1, yRow1, width, rgba);
-            ConvertUvRow(row0, uvRow, width, rgba);
+            if (rgba)
+            {
+                ConvertYAndUvRowRgba(row0, yRow0, uvRow, width);
+                ConvertYRowRgba(row1, yRow1, width);
+                continue;
+            }
+
+            ConvertYAndUvRowBgra(row0, yRow0, uvRow, width);
+            ConvertYRowBgra(row1, yRow1, width);
         }
     }
 
-    private static unsafe void ConvertYRow(byte* src, byte* dst, int width, bool rgba)
-    {
-        for (int x = 0; x < width; x++)
-        {
-            ReadRgb(src + x * 4, rgba, out int r, out int g, out int b);
-            dst[x] = ToY(r, g, b);
-        }
-    }
-
-    private static unsafe void ConvertUvRow(byte* src, byte* dst, int width, bool rgba)
+    private static unsafe void ConvertYAndUvRowBgra(byte* src, byte* yDst, byte* uvDst, int width)
     {
         for (int x = 0; x < width; x += 2)
         {
-            ReadRgb(src + x * 4, rgba, out int r, out int g, out int b);
-            dst[x] = ToU(r, g, b);
-            dst[x + 1] = ToV(r, g, b);
+            byte* pixel0 = src + x * 4;
+            byte b = pixel0[0];
+            byte g = pixel0[1];
+            byte r = pixel0[2];
+            yDst[x] = ToY(r, g, b);
+            uvDst[x] = ToU(r, g, b);
+            uvDst[x + 1] = ToV(r, g, b);
+
+            byte* pixel1 = pixel0 + 4;
+            yDst[x + 1] = ToY(pixel1[2], pixel1[1], pixel1[0]);
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void ReadRgb(byte* pixel, bool rgba, out int r, out int g, out int b)
+    private static unsafe void ConvertYAndUvRowRgba(byte* src, byte* yDst, byte* uvDst, int width)
     {
-        if (rgba)
+        for (int x = 0; x < width; x += 2)
         {
-            r = pixel[0];
-            g = pixel[1];
-            b = pixel[2];
-            return;
+            byte* pixel0 = src + x * 4;
+            byte r = pixel0[0];
+            byte g = pixel0[1];
+            byte b = pixel0[2];
+            yDst[x] = ToY(r, g, b);
+            uvDst[x] = ToU(r, g, b);
+            uvDst[x + 1] = ToV(r, g, b);
+
+            byte* pixel1 = pixel0 + 4;
+            yDst[x + 1] = ToY(pixel1[0], pixel1[1], pixel1[2]);
+        }
+    }
+
+    private static unsafe void ConvertYRowBgra(byte* src, byte* dst, int width)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            byte* pixel = src + x * 4;
+            dst[x] = ToY(pixel[2], pixel[1], pixel[0]);
+        }
+    }
+
+    private static unsafe void ConvertYRowRgba(byte* src, byte* dst, int width)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            byte* pixel = src + x * 4;
+            dst[x] = ToY(pixel[0], pixel[1], pixel[2]);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ToY(byte r, byte g, byte b)
+    {
+        return (byte)((YR[r] + YG[g] + YB[b]) >> 8);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ToU(byte r, byte g, byte b)
+    {
+        return (byte)((UR[r] + UG[g] + UB[b]) >> 8);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ToV(byte r, byte g, byte b)
+    {
+        return (byte)((VR[r] + VG[g] + VB[b]) >> 8);
+    }
+
+    private static int[] CreateTable(int multiplier, int offset)
+    {
+        int[] table = new int[256];
+        for (int i = 0; i < table.Length; i++)
+        {
+            table[i] = multiplier * i + offset;
         }
 
-        b = pixel[0];
-        g = pixel[1];
-        r = pixel[2];
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ToY(int r, int g, int b)
-    {
-        return (byte)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ToU(int r, int g, int b)
-    {
-        return (byte)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ToV(int r, int g, int b)
-    {
-        return (byte)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+        return table;
     }
 }
